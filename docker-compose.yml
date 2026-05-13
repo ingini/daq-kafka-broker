@@ -1,0 +1,183 @@
+# ============================================================
+#  daq-kafka-broker  —  서버 12번 (192.168.1.12)
+#
+#  스택:
+#    broker          Kafka 7.6.1 KRaft (Zookeeper 없음)
+#    schema-registry :8081
+#    rest-proxy      내부 전용 (nginx 뒤)
+#    daq-consumer    topic consume → transform → MinIO 151번
+#    nginx           :80/:443  SSL termination + REST Proxy 라우팅
+#    acme-companion  Let's Encrypt 자동 발급/갱신
+#
+#  실행:
+#    make up
+#    make init   ← 최초 1회 topic 생성
+#
+#  차량 → HTTPS POST:
+#    https://swm-daq.ddns.net/topics/{topic}
+#
+#  MinIO 저장 경로:
+#    daq/year=YYYY/month=MM/day=dd/{vehicle_id}/{sensor}/{ts_ns}.jpg
+# ============================================================
+
+networks:
+  broker-net:
+    driver: bridge
+
+volumes:
+  kafka-data:
+  nginx-certs:
+  nginx-vhost:
+  nginx-html:
+
+services:
+
+  # ── Kafka (KRaft — Zookeeper 없음) ──────────────────────────
+  broker:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    restart: unless-stopped
+    networks: [broker-net]
+    ports:
+      - "9092:9092"    # 내부망 직접 접근 (optional)
+    environment:
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID}
+
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@broker:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://broker:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_RETENTION_HOURS: ${KAFKA_LOG_RETENTION_HOURS:-72}
+      KAFKA_LOG_RETENTION_BYTES: ${KAFKA_LOG_RETENTION_BYTES:-107374182400}
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_MESSAGE_MAX_BYTES: 10485760
+      KAFKA_REPLICA_FETCH_MAX_BYTES: 10485760
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options: {max-size: "20m", max-file: "5"}
+
+  # ── Schema Registry ─────────────────────────────────────────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    container_name: schema-registry
+    restart: unless-stopped
+    networks: [broker-net]
+    depends_on:
+      broker:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: broker:9092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    logging:
+      driver: "json-file"
+      options: {max-size: "10m", max-file: "3"}
+
+  # ── Kafka REST Proxy (내부 전용, nginx 뒤) ───────────────────
+  # 차량은 https://swm-daq.ddns.net/topics/{topic} 으로 POST
+  # nginx 가 443 → rest-proxy:8082 로 프록시
+  rest-proxy:
+    image: confluentinc/cp-kafka-rest:7.6.1
+    container_name: rest-proxy
+    restart: unless-stopped
+    networks: [broker-net]
+    depends_on:
+      broker:
+        condition: service_healthy
+    environment:
+      VIRTUAL_HOST: ${DOMAIN}
+      VIRTUAL_PORT: 8082
+      LETSENCRYPT_HOST: ${DOMAIN}
+      LETSENCRYPT_EMAIL: ${SSL_EMAIL}
+      KAFKA_REST_HOST_NAME: rest-proxy
+      KAFKA_REST_BOOTSTRAP_SERVERS: broker:9092
+      KAFKA_REST_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      KAFKA_REST_LISTENERS: http://0.0.0.0:8082
+      KAFKA_REST_MAX_REQUEST_SIZE: 10485760
+      KAFKA_REST_PRODUCER_MAX_REQUEST_SIZE: 10485760
+    logging:
+      driver: "json-file"
+      options: {max-size: "10m", max-file: "5"}
+
+  # ── DAQ Consumer ─────────────────────────────────────────────
+  # topic consume → transform → MinIO 151번 저장
+  # 저장 경로: daq/year=YYYY/month=MM/day=dd/{vehicle_id}/{sensor}/{ts_ns}.jpg
+  daq-consumer:
+    build:
+      context: ./daq-consumer
+      dockerfile: Dockerfile
+    image: daq-consumer:latest
+    container_name: daq-consumer
+    restart: unless-stopped
+    networks: [broker-net]
+    depends_on:
+      broker:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: broker:9092
+      KAFKA_GROUP_ID: daq-consumer-group
+      KAFKA_TOPICS: ${TOPIC_CAM0},${TOPIC_CAM1},${TOPIC_CAM2},${TOPIC_GNSS}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      MAX_WORKERS: ${CONSUMER_MAX_WORKERS:-4}
+      METRICS_PORT: ${CONSUMER_METRICS_PORT:-2122}
+      LOG_LEVEL: INFO
+    ports:
+      - "2122:2122"    # Prometheus metrics
+    logging:
+      driver: "json-file"
+      options: {max-size: "20m", max-file: "5"}
+
+  # ── nginx (SSL termination + 리버스 프록시) ──────────────────
+  nginx:
+    image: nginxproxy/nginx-proxy:latest
+    container_name: nginx
+    restart: unless-stopped
+    networks: [broker-net]
+    ports:
+      - "80:80"      # Let's Encrypt HTTP-01 챌린지
+      - "443:443"    # HTTPS — 차량이 POST 하는 포트
+    volumes:
+      - nginx-certs:/etc/nginx/certs
+      - nginx-vhost:/etc/nginx/vhost.d
+      - nginx-html:/usr/share/nginx/html
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - ./nginx/custom.conf:/etc/nginx/conf.d/custom.conf:ro
+    logging:
+      driver: "json-file"
+      options: {max-size: "10m", max-file: "3"}
+
+  # ── Let's Encrypt 자동 발급/갱신 ─────────────────────────────
+  acme-companion:
+    image: nginxproxy/acme-companion:latest
+    container_name: acme-companion
+    restart: unless-stopped
+    networks: [broker-net]
+    depends_on: [nginx]
+    environment:
+      DEFAULT_EMAIL: ${SSL_EMAIL}
+    volumes:
+      - nginx-certs:/etc/nginx/certs
+      - nginx-vhost:/etc/nginx/vhost.d
+      - nginx-html:/usr/share/nginx/html
+      - /var/run/docker.sock:/var/run/docker.sock:ro
