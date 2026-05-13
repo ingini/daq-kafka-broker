@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 #  Kafka topic 초기화 (최초 1회)
-#  실행: make init  또는  bash scripts/init-topics.sh
+#  실행: make init
 # ============================================================
 set -e
 
@@ -37,12 +37,9 @@ create_topic() {
     fi
 }
 
-# 카메라: 파티션 3개 (cam0/1/2 각각)
 create_topic "$TOPIC_CAM0" 3
 create_topic "$TOPIC_CAM1" 3
 create_topic "$TOPIC_CAM2" 3
-
-# GNSS: 파티션 1개
 create_topic "$TOPIC_GNSS" 1
 
 echo ""

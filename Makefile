@@ -3,21 +3,22 @@
 #
 #  make up          전체 스택 시작
 #  make init        topic 초기화 (최초 1회)
+#  make tunnel      cloudflare URL 확인 → 차량 BROKER_REST_URL 에 입력
 #  make down        중지
 #  make restart     재시작
-#  make status      컨테이너 + topic + consumer 상태
+#  make status      전체 상태
 #  make logs        전체 로그
 #  make log-broker  Kafka 로그
 #  make log-proxy   REST Proxy 로그
 #  make log-consumer daq-consumer 로그
-#  make log-nginx   nginx 로그
+#  make log-tunnel  cloudflared 로그
 #  make topics      topic 목록
-#  make metrics     consumer Prometheus 메트릭
+#  make metrics     consumer 메트릭
 #  make clean       컨테이너 + 볼륨 전체 삭제
 # ============================================================
 
-.PHONY: all up down restart init status logs \
-        log-broker log-proxy log-consumer log-nginx \
+.PHONY: all up down restart init tunnel status logs \
+        log-broker log-proxy log-consumer log-tunnel \
         topics metrics clean help
 
 CONFIG := ./config/config.env
@@ -30,8 +31,8 @@ all: help
 up:
 	@echo "[broker] Starting all services..."
 	docker compose --env-file $(CONFIG) up -d
-	@echo "[broker] Started."
-	@echo "[broker] SSL 인증서 발급은 수분 소요 — docker logs acme-companion -f 로 확인"
+	@echo "[broker] Started. Run 'make init' if first time."
+	@echo "[broker] Run 'make tunnel' to get cloudflare URL."
 
 down:
 	docker compose --env-file $(CONFIG) down
@@ -43,6 +44,16 @@ init:
 	@chmod +x scripts/init-topics.sh
 	@bash scripts/init-topics.sh
 
+# ── Cloudflare URL 확인 ───────────────────────────────────────
+# 이 URL 을 차량 daq-kafka-producer/config/config.env 의
+# BROKER_REST_URL 에 입력
+tunnel:
+	@echo "=== Cloudflare Tunnel URL ==="
+	@docker logs cloudflared 2>&1 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | tail -1
+	@echo ""
+	@echo "차량 config.env 에 입력:"
+	@echo "  BROKER_REST_URL=$$(docker logs cloudflared 2>&1 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | tail -1)"
+
 # ── 상태 확인 ─────────────────────────────────────────────────
 status:
 	@echo "=== Containers ==="
@@ -53,12 +64,11 @@ status:
 	    --bootstrap-server localhost:9092 --list 2>/dev/null \
 	    | sed 's/^/  /' || echo "  broker not ready"
 	@echo ""
-	@echo "=== REST Proxy ==="
-	@curl -s http://localhost:8082/topics 2>/dev/null \
-	    | python3 -m json.tool 2>/dev/null || echo "  not ready (nginx SSL 발급 전이면 정상)"
+	@echo "=== Cloudflare URL ==="
+	@docker logs cloudflared 2>&1 | grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' | tail -1 | sed 's/^/  /' || echo "  tunnel not ready"
 	@echo ""
-	@echo "=== SSL certs ==="
-	@docker exec nginx ls /etc/nginx/certs/ 2>/dev/null | sed 's/^/  /' || true
+	@echo "=== REST Proxy ==="
+	@curl -s http://localhost:8082/topics 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "  not ready"
 
 topics:
 	@docker exec kafka kafka-topics \
@@ -81,11 +91,8 @@ log-proxy:
 log-consumer:
 	docker logs -f daq-consumer --tail=100
 
-log-nginx:
-	docker logs -f nginx --tail=100
-
-log-ssl:
-	docker logs -f acme-companion --tail=100
+log-tunnel:
+	docker logs -f cloudflared --tail=100
 
 # ── 정리 ──────────────────────────────────────────────────────
 clean:
@@ -95,18 +102,19 @@ clean:
 # ── 도움말 ────────────────────────────────────────────────────
 help:
 	@echo ""
-	@echo "  daq-kafka-broker (KRaft + SSL + Consumer)"
-	@echo "  ==========================================="
-	@echo "  설정 파일: config/config.env"
+	@echo "  daq-kafka-broker (KRaft + Cloudflare Tunnel)"
+	@echo "  ============================================="
+	@echo "  설정: config/config.env, config/minio.secret"
 	@echo ""
 	@echo "  make up           전체 스택 시작"
-	@echo "  make init         topic 초기화 (최초 1회, up 후 실행)"
-	@echo "  make status       상태 확인"
+	@echo "  make init         topic 초기화 (최초 1회)"
+	@echo "  make tunnel       cloudflare URL 확인"
+	@echo "  make status       전체 상태"
 	@echo "  make down         중지"
 	@echo "  make restart      재시작"
 	@echo "  make topics       topic 상세"
 	@echo "  make metrics      consumer 메트릭"
 	@echo "  make log-consumer consumer 로그"
-	@echo "  make log-ssl      SSL 발급 로그"
+	@echo "  make log-tunnel   cloudflared 로그"
 	@echo "  make clean        전체 삭제 (볼륨 포함)"
 	@echo ""

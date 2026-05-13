@@ -1,20 +1,21 @@
 # ============================================================
-#  daq-kafka-broker  —  서버 12번 (192.168.1.12)
+#  daq-kafka-broker  —  서버 66번 (192.168.1.66)
 #
 #  스택:
 #    broker          Kafka 7.6.1 KRaft (Zookeeper 없음)
-#    schema-registry :8081
-#    rest-proxy      내부 전용 (nginx 뒤)
+#    schema-registry :8081 (내부)
+#    rest-proxy      :8082 (내부)
 #    daq-consumer    topic consume → transform → MinIO 151번
-#    nginx           :80/:443  SSL termination + REST Proxy 라우팅
-#    acme-companion  Let's Encrypt 자동 발급/갱신
+#    cloudflared     trycloudflare 터널 (포트포워딩/도메인 불필요)
 #
 #  실행:
 #    make up
-#    make init   ← 최초 1회 topic 생성
+#    make init     ← 최초 1회 topic 생성
+#    make tunnel   ← cloudflare URL 확인
 #
-#  차량 → HTTPS POST:
-#    https://swm-daq.ddns.net/topics/{topic}
+#  차량 설정:
+#    BROKER_REST_URL=https://xxxx.trycloudflare.com
+#    (make tunnel 로 URL 확인 후 차량 config.env 에 입력)
 #
 #  MinIO 저장 경로:
 #    daq/year=YYYY/month=MM/day=dd/{vehicle_id}/{sensor}/{ts_ns}.jpg
@@ -26,9 +27,6 @@ networks:
 
 volumes:
   kafka-data:
-  nginx-certs:
-  nginx-vhost:
-  nginx-html:
 
 services:
 
@@ -38,8 +36,6 @@ services:
     container_name: kafka
     restart: unless-stopped
     networks: [broker-net]
-    ports:
-      - "9092:9092"    # 내부망 직접 접근 (optional)
     environment:
       CLUSTER_ID: ${KAFKA_CLUSTER_ID}
 
@@ -91,9 +87,8 @@ services:
       driver: "json-file"
       options: {max-size: "10m", max-file: "3"}
 
-  # ── Kafka REST Proxy (내부 전용, nginx 뒤) ───────────────────
-  # 차량은 https://swm-daq.ddns.net/topics/{topic} 으로 POST
-  # nginx 가 443 → rest-proxy:8082 로 프록시
+  # ── Kafka REST Proxy ─────────────────────────────────────────
+  # cloudflared 가 이 포트로 터널을 뚫어줌
   rest-proxy:
     image: confluentinc/cp-kafka-rest:7.6.1
     container_name: rest-proxy
@@ -102,24 +97,23 @@ services:
     depends_on:
       broker:
         condition: service_healthy
+      schema-registry:
+        condition: service_started
     environment:
-      VIRTUAL_HOST: ${DOMAIN}
-      VIRTUAL_PORT: 8082
-      LETSENCRYPT_HOST: ${DOMAIN}
-      LETSENCRYPT_EMAIL: ${SSL_EMAIL}
       KAFKA_REST_HOST_NAME: rest-proxy
       KAFKA_REST_BOOTSTRAP_SERVERS: broker:9092
       KAFKA_REST_SCHEMA_REGISTRY_URL: http://schema-registry:8081
       KAFKA_REST_LISTENERS: http://0.0.0.0:8082
       KAFKA_REST_MAX_REQUEST_SIZE: 10485760
       KAFKA_REST_PRODUCER_MAX_REQUEST_SIZE: 10485760
+    ports:
+      - "8082:8082"    # cloudflared 가 localhost:8082 로 터널 연결
     logging:
       driver: "json-file"
       options: {max-size: "10m", max-file: "5"}
 
   # ── DAQ Consumer ─────────────────────────────────────────────
   # topic consume → transform → MinIO 151번 저장
-  # 저장 경로: daq/year=YYYY/month=MM/day=dd/{vehicle_id}/{sensor}/{ts_ns}.jpg
   daq-consumer:
     build:
       context: ./daq-consumer
@@ -131,13 +125,14 @@ services:
     depends_on:
       broker:
         condition: service_healthy
+    env_file:
+      - ./config/config.env
+      - ./config/minio.secret
     environment:
       KAFKA_BOOTSTRAP: broker:9092
       KAFKA_GROUP_ID: daq-consumer-group
       KAFKA_TOPICS: ${TOPIC_CAM0},${TOPIC_CAM1},${TOPIC_CAM2},${TOPIC_GNSS}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT}
-      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_BUCKET: ${MINIO_BUCKET}
       MAX_WORKERS: ${CONSUMER_MAX_WORKERS:-4}
       METRICS_PORT: ${CONSUMER_METRICS_PORT:-2122}
@@ -148,36 +143,16 @@ services:
       driver: "json-file"
       options: {max-size: "20m", max-file: "5"}
 
-  # ── nginx (SSL termination + 리버스 프록시) ──────────────────
-  nginx:
-    image: nginxproxy/nginx-proxy:latest
-    container_name: nginx
+  # ── Cloudflare Tunnel ────────────────────────────────────────
+  # trycloudflare: 계정/도메인 불필요, 자동 HTTPS URL 발급
+  # URL 확인: make tunnel
+  # 주의: 컨테이너 재시작 시 URL 변경됨 → 차량 config.env 재설정 필요
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
     restart: unless-stopped
-    networks: [broker-net]
-    ports:
-      - "80:80"      # Let's Encrypt HTTP-01 챌린지
-      - "443:443"    # HTTPS — 차량이 POST 하는 포트
-    volumes:
-      - nginx-certs:/etc/nginx/certs
-      - nginx-vhost:/etc/nginx/vhost.d
-      - nginx-html:/usr/share/nginx/html
-      - /var/run/docker.sock:/tmp/docker.sock:ro
-      - ./nginx/custom.conf:/etc/nginx/conf.d/custom.conf:ro
+    network_mode: host    # localhost:8082 접근을 위해 host 네트워크 사용
+    command: tunnel --url http://localhost:8082 --no-autoupdate
     logging:
       driver: "json-file"
       options: {max-size: "10m", max-file: "3"}
-
-  # ── Let's Encrypt 자동 발급/갱신 ─────────────────────────────
-  acme-companion:
-    image: nginxproxy/acme-companion:latest
-    container_name: acme-companion
-    restart: unless-stopped
-    networks: [broker-net]
-    depends_on: [nginx]
-    environment:
-      DEFAULT_EMAIL: ${SSL_EMAIL}
-    volumes:
-      - nginx-certs:/etc/nginx/certs
-      - nginx-vhost:/etc/nginx/vhost.d
-      - nginx-html:/usr/share/nginx/html
-      - /var/run/docker.sock:/var/run/docker.sock:ro

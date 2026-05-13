@@ -7,10 +7,9 @@ daq-consumer  -  Kafka topic consume -> transform -> MinIO 151번 저장
   sensor.cam2.jpeg  ->  daq/year=YYYY/month=MM/day=dd/{vehicle_id}/cam2/{ts_ns}.jpg
   sensor.gnss       ->  daq/year=YYYY/month=MM/day=dd/{vehicle_id}/gnss/{ts_ns}.json
 
-transform:
+transform (bridge.py 규칙 동일):
   camera: [8B ts_ns BE][4B jpeg_len BE][JPEG] -> raw JPEG
-  gnss:   {latitude, longitude, height, ts_ns, ...}
-          -> {lat, lon, alt, capture_ts_ns, ...}  (bridge.py 필드명 규칙 그대로)
+  gnss:   latitude->lat, longitude->lon, height->alt, ts_ns->capture_ts_ns
 """
 from __future__ import annotations
 
@@ -89,7 +88,7 @@ SENSOR_MAP = {
 def _minio_path(vehicle_id: str, sensor: str, ts_ns: int, ext: str) -> str:
     """
     daq/year=YYYY/month=MM/day=dd/{vehicle_id}/{sensor}/{ts_ns}.{ext}
-    Hive-style 파티션 경로 — Spark/Trino 에서 파티션 pruning 가능
+    Hive-style 파티션 경로
     """
     dt = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc)
     return (
@@ -108,8 +107,7 @@ def transform_camera(
     """
     daq-kafka-producer CameraWorker._send_kafka() 포맷:
       base64( struct.pack('>QI', ts_ns, len(jpeg)) + jpeg )
-    REST Proxy 가 base64 decode 해서 bytes 로 전달.
-    반환: (jpeg_bytes, ts_ns, None) | (None, None, reason)
+    REST Proxy 가 base64 decode 후 bytes 로 전달.
     """
     if len(raw_value) < 12:
         return None, None, "too_short"
@@ -127,12 +125,8 @@ def transform_gnss(
 ) -> tuple[Optional[dict], Optional[int], Optional[str]]:
     """
     daq-kafka-producer GnssWorker._send_kafka() 포맷: JSON 문자열
-    필드명 변환 (bridge.py 규칙 동일):
-      latitude  -> lat
-      longitude -> lon
-      height    -> alt
-      ts_ns     -> capture_ts_ns
-    반환: (payload_dict, ts_ns, None) | (None, None, reason)
+    bridge.py 필드명 규칙 동일:
+      latitude->lat, longitude->lon, height->alt, ts_ns->capture_ts_ns
     """
     try:
         daq = json.loads(raw_value)
@@ -204,11 +198,7 @@ def _uploader_loop(
 
 # ── vehicle_id 추출 ───────────────────────────────────────────
 def _extract_vehicle_id(msg) -> str:
-    """
-    REST Proxy v2 header value: plain bytes
-    REST Proxy v3 header value: base64-encoded bytes
-    둘 다 시도.
-    """
+    """REST Proxy v2: plain bytes / v3: base64 둘 다 시도"""
     if not msg.headers():
         return "unknown"
     for k, v in msg.headers():
@@ -255,8 +245,8 @@ def main() -> int:
     log.info("subscribed: %s", KAFKA_TOPICS)
 
     # upload queue + workers
-    q: Queue      = Queue(maxsize=5_000)
-    stop_event    = threading.Event()
+    q: Queue   = Queue(maxsize=5_000)
+    stop_event = threading.Event()
     workers = [
         threading.Thread(
             target=_uploader_loop,
@@ -302,7 +292,6 @@ def main() -> int:
             vehicle_id = _extract_vehicle_id(msg)
             records_in.labels(topic=topic).inc()
 
-            # transform + enqueue
             if sensor.startswith("cam"):
                 jpeg, ts_ns, reason = transform_camera(raw_value)
                 if jpeg is None:
