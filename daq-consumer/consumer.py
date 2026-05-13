@@ -5,20 +5,14 @@ daq-consumer  -  Kafka topic consume -> transform -> MinIO 저장
   sensor.cam*.jpeg  -> daq/year=YYYY/month=MM/day=dd/{vehicle_id}/cam*/{ts_ns}.jpg
   sensor.gnss       -> daq/year=YYYY/month=MM/day=dd/{vehicle_id}/gnss/{ts_ns}.json
 
-transform:
-  camera : [8B ts_ns BE][4B jpeg_len BE][JPEG] -> raw JPEG
-  gnss   : latitude->lat, longitude->lon, height->alt, ts_ns->capture_ts_ns
+transform (daq-kafka-producer server.py 포맷 기준):
+  camera: base64( struct.pack('>QI', ts_ns, jpeg_len) + jpeg ) -> raw JPEG
+  gnss:   {latitude, longitude, height, ts_ns, ...}
+          -> {lat, lon, alt, capture_ts_ns, ...}
 
-env:
-  KAFKA_BOOTSTRAP   broker 주소
-  KAFKA_GROUP_ID    consumer group
-  KAFKA_TOPICS      topic CSV
-  MINIO_ENDPOINT    MinIO 주소
-  MINIO_ACCESS_KEY  MinIO access key
-  MINIO_SECRET_KEY  MinIO secret key
-  MINIO_BUCKET      버킷명
-  MAX_WORKERS       동시 업로드 worker 수
-  LOG_LEVEL         로그 레벨
+MinIO 접근:
+  MINIO_ENDPOINT=https://221.147.232.196:8443/poc/minio
+  nginx /poc/minio/ -> MinIO 내부 서버로 프록시
 """
 from __future__ import annotations
 
@@ -35,6 +29,7 @@ import time
 from datetime import datetime, timezone
 from queue import Empty, Queue
 from typing import Optional
+from urllib.parse import urlparse
 
 from confluent_kafka import Consumer, KafkaError
 from minio import Minio
@@ -64,23 +59,51 @@ KAFKA_TOPICS_STR = os.environ.get(
 )
 KAFKA_TOPICS = [t.strip() for t in KAFKA_TOPICS_STR.split(",") if t.strip()]
 
-MINIO_ENDPOINT   = os.environ.get("MINIO_ENDPOINT",   "http://192.168.1.151:9001")
-MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
+MINIO_ENDPOINT   = os.environ.get("MINIO_ENDPOINT",   "https://221.147.232.196:8443/poc/minio")
+MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "swm")
+MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "")
 MINIO_BUCKET     = os.environ.get("MINIO_BUCKET",     "daq")
 MAX_WORKERS      = int(os.environ.get("MAX_WORKERS",  "4"))
 LOG_LEVEL        = os.environ.get("LOG_LEVEL",        "INFO").upper()
 
-# sensor.cam*.jpeg → cam* 추출
-def _sensor_name(topic: str) -> Optional[str]:
-    mapping = {
-        "sensor.cam0.jpeg": "cam0",
-        "sensor.cam1.jpeg": "cam1",
-        "sensor.cam2.jpeg": "cam2",
-        "sensor.gnss":      "gnss",
-    }
-    # 등록되지 않은 topic 은 topic명 그대로 사용
-    return mapping.get(topic, topic.replace("sensor.", ""))
+# ── topic → sensor 이름 매핑 ─────────────────────────────────
+SENSOR_MAP = {
+    "sensor.cam0.jpeg": "cam0",
+    "sensor.cam1.jpeg": "cam1",
+    "sensor.cam2.jpeg": "cam2",
+    "sensor.gnss":      "gnss",
+}
+
+
+# ── MinIO 클라이언트 초기화 ───────────────────────────────────
+def _build_minio_client() -> Minio:
+    """
+    MINIO_ENDPOINT 가 https://host:port/path 형태일 경우
+    Minio SDK 는 host:port 만 받고 prefix_path 는 별도 처리
+    nginx 가 /poc/minio/ → MinIO 로 프록시하는 구조
+    """
+    parsed = urlparse(MINIO_ENDPOINT)
+    secure = parsed.scheme == "https"
+    netloc = parsed.netloc  # 221.147.232.196:8443
+    # path prefix: /poc/minio  (trailing slash 제거)
+    prefix = parsed.path.rstrip("/")
+
+    client = Minio(
+        netloc,
+        access_key=MINIO_ACCESS_KEY,
+        secret_key=MINIO_SECRET_KEY,
+        secure=secure,
+        http_client=None,
+    )
+    # nginx prefix 가 있으면 base_url 패치
+    if prefix:
+        # minio-py 7.x: _base_url 속성으로 접근
+        from minio.helpers import BaseURL
+        import urllib3
+        base = f"{parsed.scheme}://{netloc}{prefix}/"
+        client._base_url = BaseURL(base, None)
+
+    return client
 
 
 # ── MinIO 경로 ────────────────────────────────────────────────
@@ -96,6 +119,11 @@ def _minio_path(vehicle_id: str, sensor: str, ts_ns: int, ext: str) -> str:
 
 # ── transform ────────────────────────────────────────────────
 def transform_camera(raw: bytes) -> tuple[Optional[bytes], Optional[int], Optional[str]]:
+    """
+    daq-service CameraWorker._send_kafka() 포맷:
+      base64( struct.pack('>QI', ts_ns, jpeg_len) + jpeg )
+    REST Proxy 가 base64 decode 후 bytes 로 전달
+    """
     if len(raw) < 12:
         return None, None, "too_short"
     try:
@@ -108,6 +136,10 @@ def transform_camera(raw: bytes) -> tuple[Optional[bytes], Optional[int], Option
 
 
 def transform_gnss(raw: bytes) -> tuple[Optional[dict], Optional[int], Optional[str]]:
+    """
+    daq-service GnssWorker._send_kafka() 포맷: JSON 문자열
+    필드 변환: latitude->lat, longitude->lon, height->alt, ts_ns->capture_ts_ns
+    """
     try:
         daq = json.loads(raw)
     except (ValueError, TypeError):
@@ -170,6 +202,10 @@ def _uploader_loop(idx: int, q: Queue, client: Minio,
 
 # ── vehicle_id 추출 ───────────────────────────────────────────
 def _vehicle_id(msg) -> str:
+    """
+    daq-service 가 headers 에 vehicle_id 를 plain string 으로 실어서 보냄
+    REST Proxy v2: plain bytes / v3: base64 둘 다 시도
+    """
     if not msg.headers():
         return "unknown"
     for k, v in msg.headers():
@@ -189,13 +225,13 @@ def main() -> int:
     )
 
     # MinIO 클라이언트
-    secure = MINIO_ENDPOINT.startswith("https")
-    host   = MINIO_ENDPOINT.replace("https://", "").replace("http://", "")
-    mc = Minio(host, access_key=MINIO_ACCESS_KEY,
-               secret_key=MINIO_SECRET_KEY, secure=secure)
-    if not mc.bucket_exists(MINIO_BUCKET):
-        mc.make_bucket(MINIO_BUCKET)
-        log.info("bucket created: %s", MINIO_BUCKET)
+    mc = _build_minio_client()
+    try:
+        if not mc.bucket_exists(MINIO_BUCKET):
+            mc.make_bucket(MINIO_BUCKET)
+            log.info("bucket created: %s", MINIO_BUCKET)
+    except Exception as e:
+        log.warning("MinIO 버킷 확인 실패 (나중에 재시도): %s", e)
 
     # Kafka consumer
     consumer = Consumer({
@@ -209,8 +245,8 @@ def main() -> int:
         "fetch.max.bytes":           10_485_760,
     })
     consumer.subscribe(KAFKA_TOPICS)
-    log.info("subscribed topics: %s", KAFKA_TOPICS)
-    log.info("minio: %s  bucket: %s", MINIO_ENDPOINT, MINIO_BUCKET)
+    log.info("subscribed topics : %s", KAFKA_TOPICS)
+    log.info("minio endpoint    : %s  bucket: %s", MINIO_ENDPOINT, MINIO_BUCKET)
 
     # upload queue + workers
     q          = Queue(maxsize=5_000)
@@ -253,11 +289,11 @@ def main() -> int:
                 records_dropped.labels(topic=topic, reason="empty_value").inc()
                 continue
 
-            sensor    = _sensor_name(topic)
-            vid       = _vehicle_id(msg)
+            sensor = SENSOR_MAP.get(topic, topic.replace("sensor.", ""))
+            vid    = _vehicle_id(msg)
             records_in.labels(topic=topic).inc()
 
-            # transform
+            # transform + enqueue
             if "cam" in topic:
                 jpeg, ts_ns, reason = transform_camera(raw_value)
                 if jpeg is None:
@@ -280,7 +316,7 @@ def main() -> int:
                     "application/json", sensor,
                 )
             else:
-                # 그 외 topic: raw bytes 그대로 저장
+                # 신규 topic: raw bytes 그대로 저장
                 ts_ns = time.time_ns()
                 job = _Job(
                     _minio_path(vid, sensor, ts_ns, "bin"),

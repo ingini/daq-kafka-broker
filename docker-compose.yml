@@ -1,5 +1,10 @@
 # ============================================================
-#  daq-kafka-broker
+#  daq-kafka-broker  —  서버 66번 (192.168.1.66)
+#
+#  외부 접근 구조:
+#    차량 → https://221.147.232.196:8443/poc/kafka-rest
+#         → 79번 nginx → 192.168.1.66:8082 (rest-proxy)
+#
 #  실행: ./start.sh
 #  종료: ./stop.sh
 #  설정: .env 파일만 수정
@@ -51,8 +56,7 @@ services:
       options: {max-size: "20m", max-file: "5"}
 
   # ── Kafka REST Proxy ─────────────────────────────────────────
-  # 차량이 HTTP POST 하는 엔드포인트
-  # cloudflared 가 localhost:8082 로 터널 연결
+  # 79번 nginx 가 /poc/kafka-rest/ → 192.168.1.66:8082 로 프록시
   rest-proxy:
     image: confluentinc/cp-kafka-rest:7.6.1
     container_name: rest-proxy
@@ -74,7 +78,8 @@ services:
       options: {max-size: "10m", max-file: "5"}
 
   # ── DAQ Consumer ─────────────────────────────────────────────
-  # topic consume → transform → MinIO 151번 저장
+  # topic consume → transform → MinIO 저장
+  # MinIO: https://221.147.232.196:8443/poc/minio (nginx 경유)
   daq-consumer:
     build:
       context: ./daq-consumer
@@ -99,16 +104,3 @@ services:
     logging:
       driver: "json-file"
       options: {max-size: "20m", max-file: "5"}
-
-  # ── Cloudflare Tunnel ────────────────────────────────────────
-  # trycloudflare: 계정/도메인 불필요, 자동 HTTPS URL 발급
-  # 재시작 시 URL 변경 → start.sh 가 메일로 URL 발송
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: cloudflared
-    restart: unless-stopped
-    network_mode: host
-    command: tunnel --url http://localhost:8082 --no-autoupdate
-    logging:
-      driver: "json-file"
-      options: {max-size: "10m", max-file: "3"}
