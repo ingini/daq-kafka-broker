@@ -1,0 +1,28 @@
+kafka:
+  bootstrap_servers: kafka:9092
+  group_id: red-poc-notifier
+  input_topic: events.detection
+  dlq_topic: events.detection.dlq
+
+postgres:
+  url: jdbc:postgresql://postgres:5432/redpoc
+  user: redpoc
+  password: redpoc
+
+notification:
+  kind: ${NOTIFIER_KIND:file_log}
+  file_log:
+    path: /var/log/notifier/messages.jsonl
+  slack:
+    token: "${NOTIFIER_SLACK_TOKEN:}"
+    channel: "${NOTIFIER_SLACK_CHANNEL:#road-events}"
+
+s3:
+  endpoint: "http://minio:9000"
+  access_key: "swm"
+  secret_key: "Q7mN2xvP9rT4kL8sW3zB6yHcD5fJ1aXe"
+  region: "us-east-1"
+  presign_ttl_hours: 24
+
+metrics:
+  port: ${NOTIFIER_METRICS_PORT:2116}

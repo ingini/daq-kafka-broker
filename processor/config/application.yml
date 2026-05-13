@@ -1,0 +1,44 @@
+kafka:
+  bootstrap_servers: kafka:9092
+  application_id: red-poc-processor
+  input_topic: raw.frame.metadata.decoded
+  output_topic: events.detection
+  dlq_topic: events.detection.dlq
+
+inference:
+  kind: triton
+  triton:
+    url: http://triton:8000
+    model_name: yolo26n
+    confidence_threshold: ${PROCESSOR_CONFIDENCE_THRESHOLD:0.4}
+    timeout_ms: ${PROCESSOR_TRITON_TIMEOUT_MS:5000}
+  allowed_classes: []
+
+visualize:
+  enabled: ${PROCESSOR_VISUALIZE_ENABLED:true}
+  jpeg_quality: ${PROCESSOR_VISUALIZE_JPEG_QUALITY:85}
+  subdir: result
+  key_suffix: _annotated.jpg
+
+gps:
+  kind: ${PROCESSOR_GPS_KIND:file}
+  file_path: /app/imu_gps.jsonl
+  tolerance_ms: 500
+  replay_wrap: false
+  topic: raw.gps
+  group_id: processor-gps
+  max_fixes: 18000
+
+s3:
+  endpoint: http://minio:9000
+  access_key: swm
+  secret_key: Q7mN2xvP9rT4kL8sW3zB6yHcD5fJ1aXe
+  region: us-east-1
+
+mock:
+  emit_every_n: 30
+  detection_class: construction_site
+  confidence: 0.85
+
+metrics:
+  port: ${PROCESSOR_METRICS_PORT:2115}
