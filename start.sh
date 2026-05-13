@@ -1,7 +1,6 @@
 #!/bin/bash
 # ============================================================
 #  daq-kafka-broker  start.sh
-#  사용법: ./start.sh
 # ============================================================
 set -e
 
@@ -12,7 +11,15 @@ if [ ! -f .env ]; then
     echo "[ERROR] .env 파일이 없습니다."
     exit 1
 fi
-set -a; source .env; set +a
+
+# SSL 인증서 확인
+if [ ! -f nginx/certs/fullchain.pem ] || [ ! -f nginx/certs/privkey.pem ]; then
+    echo "[ERROR] SSL 인증서가 없습니다."
+    echo "  79번 서버에서 복사:"
+    echo "  docker cp red-poc-edge:/etc/nginx/certs/fullchain.pem ./nginx/certs/"
+    echo "  docker cp red-poc-edge:/etc/nginx/certs/privkey.pem ./nginx/certs/"
+    exit 1
+fi
 
 echo ""
 echo "================================================="
@@ -57,20 +64,24 @@ echo "================================================="
 echo ""
 echo "  ✅ daq-kafka-broker 기동 완료"
 echo ""
-echo "  REST Proxy:  http://192.168.1.66:8082"
-echo "  외부 접근:   https://221.147.232.196:8443/poc/kafka-rest"
+echo "  내부 접근:"
+echo "    REST Proxy : http://192.168.1.66:8082  (컨테이너: kafka-rest-proxy)"
+echo "    MinIO API  : http://192.168.1.66:9000"
+echo "    MinIO UI   : http://192.168.1.66:9001"
 echo ""
-echo "  ※ 79번 서버 nginx에 아래 설정 추가 필요:"
-echo "    location /poc/kafka-rest/ {"
-echo "      proxy_pass http://192.168.1.66:8082/;"
-echo "    }"
+echo "  외부 접근 (nginx :8443):"
+echo "    Kafka REST : https://221.147.232.196:8443/poc/kafka-rest"
+echo "    MinIO      : https://221.147.232.196:8443/poc/minio"
+echo ""
+echo "  ※ 공유기 포트포워딩 확인:"
+echo "    8443 → 192.168.1.66:8443"
 echo ""
 echo "  차량 config/config.env:"
 echo "    BROKER_REST_URL=https://221.147.232.196:8443/poc/kafka-rest"
 echo ""
 echo "  유용한 명령:"
 echo "    docker logs -f daq-consumer    # consumer 로그"
-echo "    docker logs -f rest-proxy      # REST Proxy 로그"
+echo "    docker logs -f nginx-edge      # nginx 로그"
 echo "    docker compose ps              # 상태 확인"
 echo ""
 echo "  종료: ./stop.sh"

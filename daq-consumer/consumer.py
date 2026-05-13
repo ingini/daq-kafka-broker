@@ -59,7 +59,7 @@ KAFKA_TOPICS_STR = os.environ.get(
 )
 KAFKA_TOPICS = [t.strip() for t in KAFKA_TOPICS_STR.split(",") if t.strip()]
 
-MINIO_ENDPOINT   = os.environ.get("MINIO_ENDPOINT",   "https://221.147.232.196:8443/poc/minio")
+MINIO_ENDPOINT   = os.environ.get("MINIO_ENDPOINT",   "http://minio:9000")
 MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "swm")
 MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "")
 MINIO_BUCKET     = os.environ.get("MINIO_BUCKET",     "daq")

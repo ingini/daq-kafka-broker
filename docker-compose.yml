@@ -1,9 +1,18 @@
 # ============================================================
 #  daq-kafka-broker  —  서버 66번 (192.168.1.66)
 #
-#  외부 접근 구조:
-#    차량 → https://221.147.232.196:8443/poc/kafka-rest
-#         → 79번 nginx → 192.168.1.66:8082 (rest-proxy)
+#  79번 red-poc-edge nginx + minio 까지 통합
+#
+#  스택:
+#    broker        Kafka 7.6.1 KRaft
+#    rest-proxy    Kafka REST Proxy :8082 (내부)
+#    daq-consumer  topic consume → transform → MinIO
+#    minio         MinIO :9000/:9001
+#    nginx         :8443 SSL termination (79번 설정 그대로)
+#
+#  외부 접근:
+#    https://221.147.232.196:8443/poc/kafka-rest  → rest-proxy
+#    https://221.147.232.196:8443/poc/minio       → minio
 #
 #  실행: ./start.sh
 #  종료: ./stop.sh
@@ -16,6 +25,7 @@ networks:
 
 volumes:
   kafka-data:
+  minio-data:
 
 services:
 
@@ -56,19 +66,16 @@ services:
       options: {max-size: "20m", max-file: "5"}
 
   # ── Kafka REST Proxy ─────────────────────────────────────────
-  # 79번 nginx 가 /poc/kafka-rest/ → 192.168.1.66:8082 로 프록시
   rest-proxy:
     image: confluentinc/cp-kafka-rest:7.6.1
-    container_name: rest-proxy
+    container_name: kafka-rest-proxy
     restart: unless-stopped
     networks: [broker-net]
     depends_on:
       broker:
         condition: service_healthy
-    ports:
-      - "8082:8082"
     environment:
-      KAFKA_REST_HOST_NAME: rest-proxy
+      KAFKA_REST_HOST_NAME: kafka-rest-proxy
       KAFKA_REST_BOOTSTRAP_SERVERS: broker:9092
       KAFKA_REST_LISTENERS: http://0.0.0.0:8082
       KAFKA_REST_MAX_REQUEST_SIZE: ${KAFKA_MESSAGE_MAX_BYTES:-10485760}
@@ -77,9 +84,32 @@ services:
       driver: "json-file"
       options: {max-size: "10m", max-file: "5"}
 
+  # ── MinIO ────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    container_name: minio
+    restart: unless-stopped
+    networks: [broker-net]
+    ports:
+      - "9000:9000"    # S3 API
+      - "9001:9001"    # Console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options: {max-size: "10m", max-file: "3"}
+
   # ── DAQ Consumer ─────────────────────────────────────────────
-  # topic consume → transform → MinIO 저장
-  # MinIO: https://221.147.232.196:8443/poc/minio (nginx 경유)
   daq-consumer:
     build:
       context: ./daq-consumer
@@ -91,11 +121,13 @@ services:
     depends_on:
       broker:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP: broker:9092
       KAFKA_GROUP_ID: daq-consumer-group
       KAFKA_TOPICS: ${KAFKA_TOPICS}
-      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ENDPOINT: http://minio:9000    # 내부 컨테이너 직접 접근
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_BUCKET: ${MINIO_BUCKET}
@@ -104,3 +136,30 @@ services:
     logging:
       driver: "json-file"
       options: {max-size: "20m", max-file: "5"}
+
+  # ── nginx (79번 red-poc-edge 설정 그대로) ────────────────────
+  # 외부: https://221.147.232.196:8443
+  # /poc/kafka-rest/ → kafka-rest-proxy:8082
+  # /poc/minio/      → minio:9001
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: nginx-edge
+    restart: unless-stopped
+    networks: [broker-net]
+    ports:
+      - "8443:443"    # 공유기 포트포워딩: 221.147.232.196:8443 → 192.168.1.66:8443
+      - "8080:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - rest-proxy
+      - minio
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options: {max-size: "10m", max-file: "3"}
