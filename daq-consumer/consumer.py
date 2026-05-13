@@ -1,15 +1,24 @@
 """
-daq-consumer  -  Kafka topic consume -> transform -> MinIO 151번 저장
+daq-consumer  -  Kafka topic consume -> transform -> MinIO 저장
 
 토픽 -> MinIO 경로:
-  sensor.cam0.jpeg  ->  daq/year=YYYY/month=MM/day=dd/{vehicle_id}/cam0/{ts_ns}.jpg
-  sensor.cam1.jpeg  ->  daq/year=YYYY/month=MM/day=dd/{vehicle_id}/cam1/{ts_ns}.jpg
-  sensor.cam2.jpeg  ->  daq/year=YYYY/month=MM/day=dd/{vehicle_id}/cam2/{ts_ns}.jpg
-  sensor.gnss       ->  daq/year=YYYY/month=MM/day=dd/{vehicle_id}/gnss/{ts_ns}.json
+  sensor.cam*.jpeg  -> daq/year=YYYY/month=MM/day=dd/{vehicle_id}/cam*/{ts_ns}.jpg
+  sensor.gnss       -> daq/year=YYYY/month=MM/day=dd/{vehicle_id}/gnss/{ts_ns}.json
 
-transform (bridge.py 규칙 동일):
-  camera: [8B ts_ns BE][4B jpeg_len BE][JPEG] -> raw JPEG
-  gnss:   latitude->lat, longitude->lon, height->alt, ts_ns->capture_ts_ns
+transform:
+  camera : [8B ts_ns BE][4B jpeg_len BE][JPEG] -> raw JPEG
+  gnss   : latitude->lat, longitude->lon, height->alt, ts_ns->capture_ts_ns
+
+env:
+  KAFKA_BOOTSTRAP   broker 주소
+  KAFKA_GROUP_ID    consumer group
+  KAFKA_TOPICS      topic CSV
+  MINIO_ENDPOINT    MinIO 주소
+  MINIO_ACCESS_KEY  MinIO access key
+  MINIO_SECRET_KEY  MinIO secret key
+  MINIO_BUCKET      버킷명
+  MAX_WORKERS       동시 업로드 worker 수
+  LOG_LEVEL         로그 레벨
 """
 from __future__ import annotations
 
@@ -36,29 +45,15 @@ log = logging.getLogger("daq-consumer")
 
 # ── metrics ──────────────────────────────────────────────────
 records_in = Counter(
-    "daq_consumer_records_in_total",
-    "Records consumed from Kafka.",
-    ["topic"],
-)
+    "daq_consumer_records_in_total", "Records consumed.", ["topic"])
 records_dropped = Counter(
-    "daq_consumer_records_dropped_total",
-    "Records dropped.",
-    ["topic", "reason"],
-)
+    "daq_consumer_records_dropped_total", "Records dropped.", ["topic", "reason"])
 minio_ok = Counter(
-    "daq_consumer_minio_put_ok_total",
-    "MinIO PUT 성공.",
-    ["sensor"],
-)
+    "daq_consumer_minio_put_ok_total", "MinIO PUT 성공.", ["sensor"])
 minio_err = Counter(
-    "daq_consumer_minio_put_error_total",
-    "MinIO PUT 실패.",
-    ["sensor"],
-)
+    "daq_consumer_minio_put_error_total", "MinIO PUT 실패.", ["sensor"])
 queue_depth = Gauge(
-    "daq_consumer_queue_depth",
-    "Upload queue depth.",
-)
+    "daq_consumer_queue_depth", "Upload queue depth.")
 
 # ── env ──────────────────────────────────────────────────────
 KAFKA_BOOTSTRAP  = os.environ.get("KAFKA_BOOTSTRAP",  "localhost:9092")
@@ -74,67 +69,51 @@ MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
 MINIO_BUCKET     = os.environ.get("MINIO_BUCKET",     "daq")
 MAX_WORKERS      = int(os.environ.get("MAX_WORKERS",  "4"))
-METRICS_PORT     = int(os.environ.get("METRICS_PORT", "2122"))
+LOG_LEVEL        = os.environ.get("LOG_LEVEL",        "INFO").upper()
 
-SENSOR_MAP = {
-    "sensor.cam0.jpeg": "cam0",
-    "sensor.cam1.jpeg": "cam1",
-    "sensor.cam2.jpeg": "cam2",
-    "sensor.gnss":      "gnss",
-}
+# sensor.cam*.jpeg → cam* 추출
+def _sensor_name(topic: str) -> Optional[str]:
+    mapping = {
+        "sensor.cam0.jpeg": "cam0",
+        "sensor.cam1.jpeg": "cam1",
+        "sensor.cam2.jpeg": "cam2",
+        "sensor.gnss":      "gnss",
+    }
+    # 등록되지 않은 topic 은 topic명 그대로 사용
+    return mapping.get(topic, topic.replace("sensor.", ""))
 
 
 # ── MinIO 경로 ────────────────────────────────────────────────
 def _minio_path(vehicle_id: str, sensor: str, ts_ns: int, ext: str) -> str:
-    """
-    daq/year=YYYY/month=MM/day=dd/{vehicle_id}/{sensor}/{ts_ns}.{ext}
-    Hive-style 파티션 경로
-    """
     dt = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc)
     return (
         f"year={dt.strftime('%Y')}/"
         f"month={dt.strftime('%m')}/"
         f"day={dt.strftime('%d')}/"
-        f"{vehicle_id}/{sensor}/"
-        f"{ts_ns}.{ext}"
+        f"{vehicle_id}/{sensor}/{ts_ns}.{ext}"
     )
 
 
 # ── transform ────────────────────────────────────────────────
-def transform_camera(
-    raw_value: bytes,
-) -> tuple[Optional[bytes], Optional[int], Optional[str]]:
-    """
-    daq-kafka-producer CameraWorker._send_kafka() 포맷:
-      base64( struct.pack('>QI', ts_ns, len(jpeg)) + jpeg )
-    REST Proxy 가 base64 decode 후 bytes 로 전달.
-    """
-    if len(raw_value) < 12:
+def transform_camera(raw: bytes) -> tuple[Optional[bytes], Optional[int], Optional[str]]:
+    if len(raw) < 12:
         return None, None, "too_short"
     try:
-        ts_ns, jpeg_len = struct.unpack(">QI", raw_value[:12])
+        ts_ns, jpeg_len = struct.unpack(">QI", raw[:12])
     except struct.error:
         return None, None, "header_unpack_failed"
-    if jpeg_len <= 0 or 12 + jpeg_len > len(raw_value):
+    if jpeg_len <= 0 or 12 + jpeg_len > len(raw):
         return None, None, "bad_length"
-    return raw_value[12: 12 + jpeg_len], ts_ns, None
+    return raw[12: 12 + jpeg_len], ts_ns, None
 
 
-def transform_gnss(
-    raw_value: bytes,
-) -> tuple[Optional[dict], Optional[int], Optional[str]]:
-    """
-    daq-kafka-producer GnssWorker._send_kafka() 포맷: JSON 문자열
-    bridge.py 필드명 규칙 동일:
-      latitude->lat, longitude->lon, height->alt, ts_ns->capture_ts_ns
-    """
+def transform_gnss(raw: bytes) -> tuple[Optional[dict], Optional[int], Optional[str]]:
     try:
-        daq = json.loads(raw_value)
+        daq = json.loads(raw)
     except (ValueError, TypeError):
         return None, None, "json_parse_failed"
     if not isinstance(daq, dict):
         return None, None, "not_dict"
-
     ts_ns = daq.get("ts_ns")
     if not isinstance(ts_ns, int):
         return None, None, "missing_ts_ns"
@@ -143,12 +122,10 @@ def transform_gnss(
     if "latitude"  in daq: out["lat"] = daq["latitude"]
     if "longitude" in daq: out["lon"] = daq["longitude"]
     if "height"    in daq: out["alt"] = daq["height"]
-
     skip = {"latitude", "longitude", "height", "ts_ns"}
     for k, v in daq.items():
         if k not in skip and k not in out:
             out[k] = v
-
     return out, ts_ns, None
 
 
@@ -156,8 +133,7 @@ def transform_gnss(
 class _Job:
     __slots__ = ("object_name", "data", "length", "content_type", "sensor")
 
-    def __init__(self, object_name: str, data: bytes,
-                 content_type: str, sensor: str):
+    def __init__(self, object_name: str, data: bytes, content_type: str, sensor: str):
         self.object_name  = object_name
         self.data         = data
         self.length       = len(data)
@@ -166,10 +142,8 @@ class _Job:
 
 
 # ── uploader worker ───────────────────────────────────────────
-def _uploader_loop(
-    idx: int, q: Queue, client: Minio,
-    bucket: str, stop: threading.Event,
-) -> None:
+def _uploader_loop(idx: int, q: Queue, client: Minio,
+                   bucket: str, stop: threading.Event) -> None:
     while not stop.is_set():
         try:
             job: _Job = q.get(timeout=0.5)
@@ -177,10 +151,8 @@ def _uploader_loop(
             continue
         try:
             client.put_object(
-                bucket,
-                job.object_name,
-                io.BytesIO(job.data),
-                length=job.length,
+                bucket, job.object_name,
+                io.BytesIO(job.data), length=job.length,
                 content_type=job.content_type,
             )
             minio_ok.labels(sensor=job.sensor).inc()
@@ -197,8 +169,7 @@ def _uploader_loop(
 
 
 # ── vehicle_id 추출 ───────────────────────────────────────────
-def _extract_vehicle_id(msg) -> str:
-    """REST Proxy v2: plain bytes / v3: base64 둘 다 시도"""
+def _vehicle_id(msg) -> str:
     if not msg.headers():
         return "unknown"
     for k, v in msg.headers():
@@ -212,22 +183,18 @@ def _extract_vehicle_id(msg) -> str:
 
 # ── main ──────────────────────────────────────────────────────
 def main() -> int:
-    log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
+        level=getattr(logging, LOG_LEVEL, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
     # MinIO 클라이언트
     secure = MINIO_ENDPOINT.startswith("https")
     host   = MINIO_ENDPOINT.replace("https://", "").replace("http://", "")
-    minio_client = Minio(host,
-                         access_key=MINIO_ACCESS_KEY,
-                         secret_key=MINIO_SECRET_KEY,
-                         secure=secure)
-
-    if not minio_client.bucket_exists(MINIO_BUCKET):
-        minio_client.make_bucket(MINIO_BUCKET)
+    mc = Minio(host, access_key=MINIO_ACCESS_KEY,
+               secret_key=MINIO_SECRET_KEY, secure=secure)
+    if not mc.bucket_exists(MINIO_BUCKET):
+        mc.make_bucket(MINIO_BUCKET)
         log.info("bucket created: %s", MINIO_BUCKET)
 
     # Kafka consumer
@@ -242,15 +209,16 @@ def main() -> int:
         "fetch.max.bytes":           10_485_760,
     })
     consumer.subscribe(KAFKA_TOPICS)
-    log.info("subscribed: %s", KAFKA_TOPICS)
+    log.info("subscribed topics: %s", KAFKA_TOPICS)
+    log.info("minio: %s  bucket: %s", MINIO_ENDPOINT, MINIO_BUCKET)
 
     # upload queue + workers
-    q: Queue   = Queue(maxsize=5_000)
+    q          = Queue(maxsize=5_000)
     stop_event = threading.Event()
     workers = [
         threading.Thread(
             target=_uploader_loop,
-            args=(i, q, minio_client, MINIO_BUCKET, stop_event),
+            args=(i, q, mc, MINIO_BUCKET, stop_event),
             name=f"uploader-{i}", daemon=True,
         )
         for i in range(MAX_WORKERS)
@@ -258,18 +226,16 @@ def main() -> int:
     for t in workers:
         t.start()
 
-    if METRICS_PORT > 0:
-        start_http_server(METRICS_PORT)
-        log.info("metrics on :%d", METRICS_PORT)
+    start_http_server(2122)
+    log.info("prometheus metrics on :2122")
 
     def _shutdown(sig, _):
-        log.info("signal %d received — stopping", sig)
+        log.info("signal %d — stopping", sig)
         stop_event.set()
     signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    log.info("daq-consumer starting  kafka=%s  minio=%s  bucket=%s",
-             KAFKA_BOOTSTRAP, MINIO_ENDPOINT, MINIO_BUCKET)
+    log.info("daq-consumer ready — waiting for messages...")
 
     try:
         while not stop_event.is_set():
@@ -282,36 +248,43 @@ def main() -> int:
                 continue
 
             topic     = msg.topic()
-            sensor    = SENSOR_MAP.get(topic)
             raw_value = msg.value()
-
-            if not sensor or not raw_value:
-                records_dropped.labels(topic=topic, reason="unknown_or_empty").inc()
+            if not raw_value:
+                records_dropped.labels(topic=topic, reason="empty_value").inc()
                 continue
 
-            vehicle_id = _extract_vehicle_id(msg)
+            sensor    = _sensor_name(topic)
+            vid       = _vehicle_id(msg)
             records_in.labels(topic=topic).inc()
 
-            if sensor.startswith("cam"):
+            # transform
+            if "cam" in topic:
                 jpeg, ts_ns, reason = transform_camera(raw_value)
                 if jpeg is None:
                     records_dropped.labels(topic=topic, reason=reason).inc()
                     continue
                 ts_ns = ts_ns or time.time_ns()
                 job = _Job(
-                    _minio_path(vehicle_id, sensor, ts_ns, "jpg"),
+                    _minio_path(vid, sensor, ts_ns, "jpg"),
                     jpeg, "image/jpeg", sensor,
                 )
-            else:  # gnss
+            elif "gnss" in topic:
                 payload, ts_ns, reason = transform_gnss(raw_value)
                 if payload is None:
                     records_dropped.labels(topic=topic, reason=reason).inc()
                     continue
                 ts_ns = ts_ns or time.time_ns()
                 job = _Job(
-                    _minio_path(vehicle_id, sensor, ts_ns, "json"),
+                    _minio_path(vid, sensor, ts_ns, "json"),
                     json.dumps(payload, ensure_ascii=False).encode(),
                     "application/json", sensor,
+                )
+            else:
+                # 그 외 topic: raw bytes 그대로 저장
+                ts_ns = time.time_ns()
+                job = _Job(
+                    _minio_path(vid, sensor, ts_ns, "bin"),
+                    raw_value, "application/octet-stream", sensor,
                 )
 
             try:
