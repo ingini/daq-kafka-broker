@@ -1,0 +1,126 @@
+{
+  "title": "RED POC — Detection & Delivery Metrics",
+  "uid": "red-poc-detection",
+  "schemaVersion": 39,
+  "tags": ["red-poc", "detection"],
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Detections per second (by class)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (class_name) (rate(processor_detections_produced_total[1m]))",
+          "legendFormat": "{{class_name}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Inference latency P50 / P95 / P99",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(processor_inference_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(processor_inference_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(processor_inference_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P99"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Transcoder decode success rate",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(transcoder_sensor_decode_success_total[5m]) / clamp_min(rate(transcoder_sensor_decode_attempts_total[5m]), 0.001)",
+          "legendFormat": "success ratio"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1 }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Transcoder errors by stage",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (stage) (rate(transcoder_decode_errors_total[5m]))",
+          "legendFormat": "{{stage}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Notify latency by channel (P95)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, channel) (rate(notifier_notify_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{channel}} P95"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "sent_messages persisted (by channel + status)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (channel, status) (rate(notifier_sent_messages_persisted_total[1m]))",
+          "legendFormat": "{{channel}}/{{status}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Processor inference errors (by stage)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (stage) (rate(processor_inference_errors_total[5m]))",
+          "legendFormat": "{{stage}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Notifier events persisted (insert vs duplicate)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 24, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(notifier_events_persisted_total[1m]))",
+          "legendFormat": "{{result}}"
+        }
+      ]
+    }
+  ]
+}

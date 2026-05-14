@@ -1,0 +1,4 @@
+paho-mqtt>=2.1.0
+confluent-kafka>=2.4.0
+prometheus-client>=0.20.0
+PyYAML>=6.0

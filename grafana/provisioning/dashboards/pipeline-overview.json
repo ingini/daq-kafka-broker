@@ -1,0 +1,179 @@
+{
+  "title": "RED POC — Pipeline Overview",
+  "uid": "red-poc-overview",
+  "schemaVersion": 39,
+  "tags": ["red-poc"],
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Sensor Generator — packets sent (rate/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (sensor) (rate(sensor_generator_packets_sent_total[1m]))",
+          "legendFormat": "{{sensor}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Edge Agent — packets received (rate/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (sensor) (rate(edge_packets_received_total[1m]))",
+          "legendFormat": "{{sensor}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Edge Agent — bundle upload P50/P95 (s)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(edge_bundle_upload_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P95"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(edge_bundle_upload_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P50"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "MQTT → Kafka bridge (msgs/s by topic)",
+      "description": "Split by Kafka destination topic. frames/gps 두 route 가 각각 독립 시계열로 보여야 함.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (kafka_topic) (rate(mqtt_kafka_bridge_messages_total[1m]))",
+          "legendFormat": "{{kafka_topic}}"
+        },
+        {
+          "expr": "sum(rate(mqtt_kafka_bridge_unrouted_total[1m]))",
+          "legendFormat": "unrouted (dropped)"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Transcoder — JPEGs/s",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(transcoder_jpegs_out_total[1m])",
+          "legendFormat": "jpegs"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Pipeline errors (rate/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (service, stage) (rate(edge_pipeline_errors_total[5m]))",
+          "legendFormat": "{{service}} / {{stage}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "GPS — samples emitted & published (rate/s)",
+      "description": "edge_gps_samples_emitted_total: BynavX1 파서가 뽑아낸 fix 수. edge_gps_published_total: MQTT 로 성공적으로 보낸 수. 두 값이 거의 같아야 정상 (publish error 시 gap 발생).",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(edge_gps_samples_emitted_total[1m])",
+          "legendFormat": "parsed"
+        },
+        {
+          "expr": "rate(edge_gps_published_total[1m])",
+          "legendFormat": "published"
+        },
+        {
+          "expr": "rate(edge_gps_publish_errors_total[1m])",
+          "legendFormat": "publish_errors"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "GPS — parser health",
+      "description": "parse_errors 는 CRC 실패 (strict mode) 또는 프레이밍 오류. buffer_resets 는 MaxBufferBytes 초과로 인한 stream resync. 지속 증가 시 cable/장비 설정 재검토.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 24, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "rate(edge_gps_parse_errors_total[5m])",
+          "legendFormat": "parse_errors/s"
+        },
+        {
+          "expr": "rate(edge_gps_buffer_resets_total[5m])",
+          "legendFormat": "buffer_resets/s"
+        },
+        {
+          "expr": "rate(edge_gps_read_errors_total[5m])",
+          "legendFormat": "read_errors/s"
+        },
+        {
+          "expr": "rate(edge_gps_connect_errors_total[5m])",
+          "legendFormat": "connect_errors/s"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "GPS — throughput (bytes/s from IMU TCP)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 32, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "Bps" } },
+      "targets": [
+        {
+          "expr": "rate(edge_gps_bytes_received_total[1m])",
+          "legendFormat": "bytes/s"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "GPS — connection state",
+      "description": "connections_total 는 TCP dial 성공 횟수 (누적). 값이 증가하면 중간에 재연결이 있었다는 뜻. 안정 운영 시 거의 1.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 32, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "edge_gps_connections_total",
+          "legendFormat": "successful_dials"
+        },
+        {
+          "expr": "edge_gps_connect_errors_total",
+          "legendFormat": "failed_dials"
+        }
+      ]
+    }
+  ]
+}

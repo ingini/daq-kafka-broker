@@ -1,0 +1,235 @@
+# Prometheus alerting rules for RED POC.
+#
+# No Alertmanager is wired in yet — these rules surface at
+# http://<prom>:9090/alerts as Pending → Firing transitions, and Grafana
+# can also render them via the unified alerting tab. Hook an
+# Alertmanager later when operational paging is needed.
+#
+# Conventions:
+#   - severity: info | warning | critical (matches common Alertmanager
+#     routing)
+#   - all rules have a `for:` window so single-scrape flickers don't
+#     page. Windows follow: health probes 1–2 min, throughput 5 min,
+#     long-horizon (queue drift, lag) 10 min.
+groups:
+  # ------------------------------------------------------------
+  # Scrape health — covers "service down" generically so we don't
+  # need a separate alert per service.
+  # ------------------------------------------------------------
+  - name: scrape
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Scrape target down: {{ $labels.job }} ({{ $labels.instance }})"
+          description: "Prometheus 가 {{ $labels.job }} / {{ $labels.instance }} 를 2 분 이상 scrape 하지 못함. 서비스 다운 또는 네트워크 문제."
+
+  # ------------------------------------------------------------
+  # Edge-side health
+  # ------------------------------------------------------------
+  - name: edge-agent
+    rules:
+      - alert: EdgePipelineErrors
+        expr: sum by (stage) (rate(edge_pipeline_errors_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "edge-agent pipeline errors ({{ $labels.stage }})"
+          description: "5 분 평균 > 0.1/s — queue/upload/publish 한 스테이지가 지속 실패 중. 가장 흔한 원인은 MinIO 또는 MQTT 브로커 down."
+
+      - alert: EdgeNoIngress
+        expr: |
+          sum(rate(edge_packets_received_total[2m])) == 0
+          and on() sum(rate(sensor_generator_packets_sent_total[2m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "edge-agent 가 UDP 를 못 받고 있음"
+          description: "sensor-generator 는 송신 중인데 edge 수신량이 0. port 바인드 실패, host networking 설정 변경, 방화벽 등을 의심."
+
+      - alert: GpsParseErrorsSustained
+        expr: rate(edge_gps_parse_errors_total[10m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "BynavX1 parse errors 지속"
+          description: "10 분 평균 > 0.5/s — CRC 불일치 또는 프레이밍 에러. lenient_crc 로 잠시 올리고 장비/케이블 점검."
+
+      - alert: GpsConnectionFlapping
+        expr: rate(edge_gps_connections_total[10m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "BynavX1 TCP 재연결 반복"
+          description: "10 분 동안 분당 3 회 넘게 재연결. 정상 운영 시 connections_total 은 거의 증가하지 않아야 함."
+
+      - alert: GpsPublishLosing
+        expr: |
+          rate(edge_gps_samples_emitted_total[5m])
+            - rate(edge_gps_published_total[5m])
+            > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPS 샘플이 MQTT publish 단계에서 drop 되고 있음"
+          description: "파싱 수와 publish 수의 gap 이 5 분 평균 > 0.5/s. MQTT 브로커 응답, QoS 충돌 확인."
+
+  # ------------------------------------------------------------
+  # MQTT ↔ Kafka bridge
+  # ------------------------------------------------------------
+  - name: bridge
+    rules:
+      - alert: BridgeUnroutedMessages
+        expr: rate(mqtt_kafka_bridge_unrouted_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MQTT 메시지가 bridge ROUTES 에 매칭되지 않아 drop 됨"
+          description: "새 topic prefix 를 쓰기 시작했는데 bridge ROUTES env 가 업데이트 안 된 상태. 메시지가 계속 버려지므로 즉시 조치 필요."
+
+      - alert: BridgeBufferFullFrequent
+        expr: rate(mqtt_kafka_bridge_buffer_full_total[5m]) > 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "bridge Kafka producer 버퍼가 반복적으로 full"
+          description: "Kafka broker 처리량 저하 또는 linger/batch 설정이 트래픽에 비해 보수적. bridge strict flush 경로가 latency 에 영향."
+
+  # ------------------------------------------------------------
+  # Processor / transcoder / notifier
+  # ------------------------------------------------------------
+  - name: processing
+    rules:
+      - alert: TranscoderDecodeFailureRatio
+        expr: |
+          rate(transcoder_decode_errors_total[5m])
+            / clamp_min(rate(transcoder_sensor_decode_attempts_total[5m]), 1)
+          > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "transcoder decode 실패율 > 10%"
+          description: "10 분 지속. MPEG-TS 프레임 누락이나 ffmpeg 부하. QA-001 회귀 의심 시 GopAccumulator 확인."
+
+      - alert: ProcessorInferenceLatencyP95
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(processor_inference_duration_seconds_bucket[5m])) by (le)
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "processor inference P95 > 2s"
+          description: "Triton 과부하, GPU 스위치, 또는 이미지 fetch 지연. Triton 대시보드의 queue_duration 대비 compute_infer 비율 확인."
+
+      - alert: ProcessorInferenceFailing
+        expr: |
+          rate(processor_inference_errors_total[5m])
+            / clamp_min(rate(processor_bundles_consumed_total[5m]), 1)
+          > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "processor inference 에러율 > 5%"
+          description: "Triton 연결 실패 또는 이미지 fetch 실패가 대부분. stage label 확인."
+
+      - alert: NotifierPersistFailing
+        expr: |
+          sum by (result) (rate(notifier_events_persisted_total{result="error"}[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "notifier 이벤트 저장 실패"
+          description: "Postgres 연결 불안정 또는 스키마 문제. DB health check 우선."
+
+  # ------------------------------------------------------------
+  # Kafka
+  # ------------------------------------------------------------
+  - name: kafka
+    rules:
+      - alert: KafkaBrokersDown
+        expr: kafka_brokers < 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka 브로커 수가 1 미만"
+          description: "POC 는 broker 1개만 있으므로 이 경보가 뜨면 Kafka 전체 다운. edge queue 가 backpressure 로 차오르기 시작함."
+
+      - alert: KafkaConsumerLagHigh
+        expr: sum by (consumergroup, topic) (kafka_consumergroup_lag) > 5000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "consumer lag 높음: {{ $labels.consumergroup }} / {{ $labels.topic }}"
+          description: "10 분 평균 > 5000 메시지. consumer scale-out 또는 처리 로직 최적화 필요."
+
+      - alert: KafkaUnderReplicatedPartitions
+        expr: sum(kafka_topic_partition_under_replicated_partition) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka under-replicated partition 발생"
+          description: "rf=1 POC 에서는 broker 상태가 불안정함을 의미. 재기동 후에도 지속되면 broker 로그 확인."
+
+  # ------------------------------------------------------------
+  # MinIO
+  # ------------------------------------------------------------
+  - name: minio
+    rules:
+      # MinIO v2 는 per-API 4xx/5xx 카운터를 더 이상 노출하지 않는다.
+      # 대신 reject 사유별 카운터로 클라이언트/권한 오류를 포착한다.
+      - alert: MinIORejectedRequests
+        expr: |
+          sum(rate(minio_s3_requests_rejected_auth_total[5m]))
+          + sum(rate(minio_s3_requests_rejected_header_total[5m]))
+          + sum(rate(minio_s3_requests_rejected_invalid_total[5m]))
+          > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MinIO reject 증가"
+          description: "5 분 평균 > 0.1/s 의 요청이 reject 됨. access_key 오류, 클라이언트 시계 드리프트, 잘못된 헤더 등이 원인."
+
+      - alert: MinIOBacklog
+        expr: minio_s3_requests_waiting_total > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MinIO S3 요청 대기 queue 길이 > 50"
+          description: "디스크 I/O 포화 또는 네트워크 병목. edge-agent 업로드가 지연됨."
+
+  # ------------------------------------------------------------
+  # Triton
+  # ------------------------------------------------------------
+  - name: triton
+    rules:
+      - alert: TritonInferenceFailures
+        expr: |
+          sum by (model) (rate(nv_inference_request_failure[5m]))
+            / clamp_min(sum by (model) (rate(nv_inference_request_success[5m])), 1)
+          > 0.01
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Triton 추론 실패율 > 1%: {{ $labels.model }}"
+          description: "모델 리로드 직후 또는 입력 shape 불일치가 가장 흔함. processor 의 inference_errors_total stage label 과 대조."

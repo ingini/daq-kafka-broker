@@ -1,0 +1,114 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Alert / recording rules live in separate files so edits don't require
+# touching this config and reloading. Add new files under infra/prometheus/
+# and reference them here.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # EMQX exposes metrics on port 18083 under /api/v5/prometheus/stats
+  - job_name: emqx
+    metrics_path: /api/v5/prometheus/stats
+    static_configs:
+      - targets: ["emqx:18083"]
+
+  # Kafka via danielqsj/kafka-exporter — uses the Kafka protocol, no
+  # JMX agent required. Provides broker count, topic offsets, consumer
+  # group lag, under-replicated partition gauge.
+  - job_name: kafka
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+        labels: { service: kafka }
+
+  # MinIO v2 metrics is split across 3 endpoints:
+  #   /cluster -- cluster-wide usage gauges
+  #   /bucket  -- per-bucket object count / size (label: bucket)
+  #   /node    -- per-node S3 request / traffic counters
+  # All are public thanks to MINIO_PROMETHEUS_AUTH_TYPE=public (POC).
+  - job_name: minio-cluster
+    metrics_path: /minio/v2/metrics/cluster
+    static_configs:
+      - targets: ["minio:9000"]
+        labels: { scope: cluster }
+
+  - job_name: minio-bucket
+    metrics_path: /minio/v2/metrics/bucket
+    static_configs:
+      - targets: ["minio:9000"]
+        labels: { scope: bucket }
+
+  - job_name: minio-node
+    metrics_path: /minio/v2/metrics/node
+    static_configs:
+      - targets: ["minio:9000"]
+        labels: { scope: node }
+
+  # Triton Inference Server native Prometheus endpoint.
+  - job_name: triton
+    static_configs:
+      - targets: ["triton:8002"]
+
+  # Service instrumentation (/metrics).
+  - job_name: edge-agent
+    static_configs:
+      - targets: ["host.docker.internal:2112"]
+        labels: { service: edge-agent }
+
+  - job_name: sensor-generator
+    static_configs:
+      - targets: ["host.docker.internal:2113"]
+        labels: { service: sensor-generator }
+
+  - job_name: transcoder
+    static_configs:
+      - targets: ["transcoder:2114"]
+        labels: { service: transcoder }
+
+  - job_name: processor
+    static_configs:
+      - targets: ["processor:2115"]
+        labels: { service: processor }
+
+  - job_name: notifier
+    static_configs:
+      - targets: ["notifier:2116"]
+        labels: { service: notifier }
+
+  - job_name: mqtt-kafka-bridge
+    static_configs:
+      - targets: ["mqtt-kafka-bridge:2117"]
+        labels: { service: mqtt-kafka-bridge }
+
+  # kafka-image-consumer (optional Kafka REST Proxy alternative path).
+  # Only reachable when COMPOSE_PROFILES=kafka-rest is set; otherwise the
+  # scrape just fails and Prometheus marks the target as down — harmless.
+  - job_name: kafka-image-consumer
+    static_configs:
+      - targets: ["kafka-image-consumer:2118"]
+        labels: { service: kafka-image-consumer }
+
+  # kafka-frame-bridge (Path B 의 missing link — raw.frame.images 를
+  # FrameBundleMeta 로 변환하여 processor 추론을 트리거). 동일 profile.
+  - job_name: kafka-frame-bridge
+    static_configs:
+      - targets: ["kafka-frame-bridge:2120"]
+        labels: { service: kafka-frame-bridge }
+
+  # kafka-imu-archiver (raw.gps → MinIO 분 단위 .jsonl batch). 동일 profile.
+  - job_name: kafka-imu-archiver
+    static_configs:
+      - targets: ["kafka-imu-archiver:2121"]
+        labels: { service: kafka-imu-archiver }
+
+  # topic-mapper (sensor.* → raw.* 변환 forward). Phase 3 신규 device 통합.
+  - job_name: topic-mapper
+    static_configs:
+      - targets: ["topic-mapper:2123"]
+        labels: { service: topic-mapper }

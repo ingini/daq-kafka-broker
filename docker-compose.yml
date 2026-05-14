@@ -154,7 +154,7 @@ services:
   # raw.frame.images + sensor.cam*.jpeg → MinIO 저장
   kafka-image-consumer:
     build:
-      context: /home/swmai/project/kepco/infra/kafka-image-consumer
+      context: ./kafka-image-consumer
       dockerfile: Dockerfile
     image: red-poc/kafka-image-consumer:dev
     container_name: red-poc-kafka-image-consumer
@@ -187,7 +187,7 @@ services:
   # raw.frame.images → raw.frame.metadata.decoded (Triton 트리거)
   kafka-frame-bridge:
     build:
-      context: /home/swmai/project/kepco/infra/kafka-frame-bridge
+      context: ./kafka-frame-bridge
       dockerfile: Dockerfile
     image: red-poc/kafka-frame-bridge:dev
     container_name: red-poc-kafka-frame-bridge
@@ -218,7 +218,7 @@ services:
   # raw.imu + raw.gps → MinIO Parquet
   kafka-imu-archiver:
     build:
-      context: /home/swmai/project/kepco/infra/kafka-imu-archiver
+      context: ./kafka-imu-archiver
       dockerfile: Dockerfile
     image: red-poc/kafka-imu-archiver:dev
     container_name: red-poc-kafka-imu-archiver
@@ -327,7 +327,7 @@ services:
   # ── Processor (Java — Triton 추론 처리) ──────────────────────
   processor:
     build:
-      context: /home/swmai/project/kepco/services/processor
+      context: ./processor
       dockerfile: Dockerfile
       target: runtime
     image: red-poc/processor:dev
@@ -343,7 +343,7 @@ services:
         condition: service_healthy
     volumes:
       - ./processor/config/application.yml:/app/application.yml:ro
-      - /home/swmai/project/kepco/data/input/imu_gps.jsonl:/app/imu_gps.jsonl:ro
+      - ./data/input/imu_gps.jsonl:/app/imu_gps.jsonl:ro
     logging:
       driver: "json-file"
       options: {max-size: "20m", max-file: "5"}
@@ -351,7 +351,7 @@ services:
   # ── Notifier (Java — 이벤트 알림) ────────────────────────────
   notifier:
     build:
-      context: /home/swmai/project/kepco/services/notifier
+      context: ./notifier
       dockerfile: Dockerfile
       target: runtime
     image: red-poc/notifier:dev
@@ -365,7 +365,7 @@ services:
         condition: service_healthy
     volumes:
       - ./notifier/config/application.yml:/app/application.yml:ro
-      - /home/swmai/project/kepco/logs:/var/log/notifier
+      - ./logs:/var/log/notifier
     logging:
       driver: "json-file"
       options: {max-size: "10m", max-file: "5"}
@@ -373,7 +373,7 @@ services:
   # ── Transcoder ───────────────────────────────────────────────
   transcoder:
     build:
-      context: /home/swmai/project/kepco/services/transcoder
+      context: ./transcoder
       dockerfile: Dockerfile
     image: red-poc/transcoder:dev
     container_name: red-poc-transcoder
@@ -382,7 +382,7 @@ services:
     ports:
       - "2114:2114"
     volumes:
-      - /home/swmai/project/kepco/services/transcoder/config.yml:/app/config.yml:ro
+      - ./transcoder/config.yml:/app/config.yml:ro
     logging:
       driver: "json-file"
       options: {max-size: "10m", max-file: "3"}
@@ -401,7 +401,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - /home/swmai/project/kepco/infra/postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-redpoc} -d ${POSTGRES_DB:-redpoc}"]
       interval: 10s
@@ -444,7 +444,7 @@ services:
   # ── MQTT → Kafka Bridge ────────────────────────────────────────
   mqtt-kafka-bridge:
     build:
-      context: /home/swmai/project/kepco/infra/mqtt-kafka-bridge
+      context: ./mqtt-kafka-bridge
       dockerfile: Dockerfile
     image: red-poc/mqtt-kafka-bridge:dev
     container_name: red-poc-mqtt-kafka-bridge
@@ -501,8 +501,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - /home/swmai/project/kepco/infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - /home/swmai/project/kepco/infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
     ports:
       - "19090:9090"
@@ -524,7 +524,7 @@ services:
       GF_SERVER_ROOT_URL: ${GF_SERVER_ROOT_URL}
       GF_SERVER_SERVE_FROM_SUB_PATH: ${GF_SERVER_SERVE_FROM_SUB_PATH:-true}
     volumes:
-      - /home/swmai/project/kepco/infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - grafana-data:/var/lib/grafana
     ports:
       - "13000:3000"
@@ -556,3 +556,36 @@ services:
     logging:
       driver: "json-file"
       options: {max-size: "10m", max-file: "3"}
+  # ── Topic Mapper ──────────────────────────────────────────────
+  # sensor.cam*.jpeg → raw.frame.images (12B 헤더 제거 + ts_ns header 추가)
+  # sensor.gnss      → raw.gps (schema 변환)
+  topic-mapper:
+    build:
+      context: ./topic-mapper
+      dockerfile: Dockerfile
+    image: red-poc/topic-mapper:dev
+    container_name: red-poc-topic-mapper
+    restart: unless-stopped
+    networks: [red-poc]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    ports:
+      - "2123:2123"
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      GROUP_ID: topic-mapper
+      SOURCE_CAM0: ${TOPIC_CAM0:-sensor.cam0.jpeg}
+      SOURCE_CAM1: ${TOPIC_CAM1:-sensor.cam1.jpeg}
+      SOURCE_CAM2: ${TOPIC_CAM2:-sensor.cam2.jpeg}
+      SOURCE_GNSS: ${TOPIC_GNSS:-sensor.gnss}
+      TARGET_CAM_TOPIC: raw.frame.images
+      TARGET_GPS_TOPIC: raw.gps
+      VEHICLE_ID_MAP: "{}"
+      METRICS_PORT: "2123"
+      LOG_LEVEL: INFO
+    logging:
+      driver: "json-file"
+      options: {max-size: "10m", max-file: "5"}

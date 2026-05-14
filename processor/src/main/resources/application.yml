@@ -1,0 +1,73 @@
+kafka:
+  bootstrap_servers: kafka:9092
+  application_id: red-poc-processor
+  # Transcoder가 decode 한 JPEG URI가 포함된 토픽. mock 경로를 쓸 때는
+  # raw.frame.metadata 로 바꾸어도 동작 (images_decoded 없으면 images 사용).
+  input_topic: raw.frame.metadata.decoded
+  output_topic: events.detection
+  dlq_topic: events.detection.dlq
+
+inference:
+  kind: triton           # mock | triton
+  triton:
+    # HTTP v2 API (binary tensor protocol). 컨테이너 내부 포트 8000.
+    url: http://triton:8000
+    model_name: yolo26n
+    confidence_threshold: 0.4    # 운영용 기본. 모든 경로 검증은 0.02 로 일시 낮춰서.
+    timeout_ms: 5000
+  # 비어 있거나 미지정이면 COCO 80 전체 허용. 지정 시 해당 클래스만 이벤트로.
+  # 예:  allowed_classes: ["bus", "truck", "car", "person"]
+  allowed_classes: []
+
+# 검출 결과를 원본 JPEG 에 bbox + label 로 그려서 MinIO 에 재업로드.
+# events.detection 메시지의 annotated_uris 필드에 경로가 실린다.
+#
+# Key 규칙:
+#   원본:  daq/<YYYY>/<MM>/<DD>/<HH>/<vehicle>/<cam>/<ts>.jpg
+#   결과:  daq/<YYYY>/<MM>/<DD>/<HH>/<vehicle>/<cam>/<subdir>/<ts><key_suffix>
+#
+#   예) daq/2026/05/11/09/VID_001/cam0/20260511T091634_xxx.jpg
+#       → daq/2026/05/11/09/VID_001/cam0/result/20260511T091634_xxx_annotated.jpg
+visualize:
+  enabled: true
+  jpeg_quality: 85
+  subdir: result
+  key_suffix: _annotated.jpg
+
+# IMU/GPS 소스.
+#   kind: file  -- scripts/extract-imu-gps.py 가 뽑은 JSONL 을 로드 (dev 기본)
+#   kind: kafka -- raw.gps 토픽에서 live 샘플을 소비 (prod, BynavX1 TCP)
+#   kind: none  -- GPS 비활성
+# kafka 경로는 edge-agent GPS + mqtt-kafka-bridge 를 전제로 한다.
+gps:
+  kind: file
+  file_path: /app/imu_gps.jsonl
+  tolerance_ms: 500
+  # edge-agent 가 replay anchor 로 pcap-space ts 를 이미 전파하므로
+  # wrap 불필요 (bundle ts 와 GPS ts 가 같은 축).
+  replay_wrap: false
+  # kind=kafka 일 때만 사용.
+  topic: raw.gps
+  group_id: processor-gps
+  max_fixes: 18000   # 30 min @ 10 Hz
+
+# MinIO / S3 — TritonInferencer 가 JPEG fetch + JpegAnnotator 가 PUT 시 사용.
+# ⚠️ minio 컨테이너의 MINIO_ROOT_USER/PASSWORD 와 일치해야 함.
+#    현재 prod: swm / (infra/profiles/prod/.env 의 MINIO_ROOT_PASSWORD)
+#    dev: minioadmin / minioadmin
+# 운영 cred 교체 시 본 파일도 동기화하거나, ProcessorConfig.load() 에
+# env-substitution 추가 (별도 작업).
+s3:
+  endpoint: http://minio:9000
+  access_key: swm
+  secret_key: Q7mN2xvP9rT4kL8sW3zB6yHcD5fJ1aXe
+  region: us-east-1
+
+# 데모용 mock 추론 (inference.kind=mock 일 때만).
+mock:
+  emit_every_n: 30
+  detection_class: construction_site
+  confidence: 0.85
+
+metrics:
+  port: 2115

@@ -1,0 +1,249 @@
+{
+  "title": "RED POC — Infrastructure (Kafka / MinIO / Triton)",
+  "uid": "red-poc-infra",
+  "schemaVersion": 39,
+  "tags": ["red-poc", "infra"],
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 100,
+      "title": "── Kafka ──",
+      "type": "row",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 101,
+      "title": "Kafka brokers online",
+      "description": "danielqsj/kafka-exporter. 1 이어야 정상 (POC 단일 브로커).",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 1, "w": 4, "h": 6 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } } },
+      "targets": [{ "expr": "kafka_brokers", "legendFormat": "brokers" }]
+    },
+    {
+      "id": 102,
+      "title": "Topic size (msgs currently committed)",
+      "description": "partition 별 current offset 합. raw.frame.metadata / raw.gps / events.detection 별 추세.",
+      "type": "timeseries",
+      "gridPos": { "x": 4, "y": 1, "w": 12, "h": 6 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (topic) (kafka_topic_partition_current_offset{topic!~\"__.*\"})",
+          "legendFormat": "{{topic}}"
+        }
+      ]
+    },
+    {
+      "id": 103,
+      "title": "Message rate into topic (msgs/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 1, "w": 8, "h": 6 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (topic) (rate(kafka_topic_partition_current_offset{topic!~\"__.*\"}[1m]))",
+          "legendFormat": "{{topic}}"
+        }
+      ]
+    },
+    {
+      "id": 104,
+      "title": "Consumer group lag",
+      "description": "kafka_consumergroup_lag — processor/notifier 가 얼마나 뒤쳐졌는지. 수천을 지속 유지하면 bottleneck.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 7, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (consumergroup, topic) (kafka_consumergroup_lag)",
+          "legendFormat": "{{consumergroup}} / {{topic}}"
+        }
+      ]
+    },
+    {
+      "id": 105,
+      "title": "Under-replicated / offline partitions",
+      "description": "0 이어야 정상. 1 broker POC 에서는 rf=1 이므로 broker 다운 시 곧바로 offline.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 7, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum(kafka_topic_partition_under_replicated_partition)",
+          "legendFormat": "under_replicated"
+        },
+        {
+          "expr": "sum(kafka_topic_partition_in_sync_replica) - sum(kafka_topic_partition_replicas)",
+          "legendFormat": "isr_gap"
+        }
+      ]
+    },
+
+    {
+      "id": 200,
+      "title": "── MinIO ──",
+      "type": "row",
+      "gridPos": { "x": 0, "y": 15, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 201,
+      "title": "Bucket object count — red-poc",
+      "description": "MinIO v2 per-bucket gauge. /minio/v2/metrics/bucket 에서 수집.",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 16, "w": 6, "h": 6 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "max(minio_bucket_usage_object_total{bucket=\"red-poc\"})",
+          "legendFormat": "objects"
+        }
+      ]
+    },
+    {
+      "id": 202,
+      "title": "Bucket size — red-poc",
+      "type": "stat",
+      "gridPos": { "x": 6, "y": 16, "w": 6, "h": 6 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "targets": [
+        {
+          "expr": "max(minio_bucket_usage_total_bytes{bucket=\"red-poc\"})",
+          "legendFormat": "bytes"
+        }
+      ]
+    },
+    {
+      "id": 203,
+      "title": "S3 in-flight requests (gauge)",
+      "description": "minio_s3_requests_incoming_total 은 gauge (현재 처리 중인 수). 지속 증가 = backlog.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 6 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "minio_s3_requests_incoming_total",
+          "legendFormat": "incoming"
+        },
+        {
+          "expr": "minio_s3_requests_waiting_total",
+          "legendFormat": "waiting"
+        }
+      ]
+    },
+    {
+      "id": 204,
+      "title": "S3 traffic in/out (Bps)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 22, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "Bps" } },
+      "targets": [
+        { "expr": "rate(minio_s3_traffic_received_bytes[1m])", "legendFormat": "received" },
+        { "expr": "rate(minio_s3_traffic_sent_bytes[1m])", "legendFormat": "sent" }
+      ]
+    },
+    {
+      "id": 205,
+      "title": "S3 rejected requests/s (auth / header / invalid / timestamp)",
+      "description": "MinIO v2 에는 per-API 4xx/5xx 카운터가 없다. 대신 reject 사유별 카운터가 있어 이상 징후(크레덴셜 오류, 잘못된 클라이언트) 감지에 사용.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 22, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "rate(minio_s3_requests_rejected_auth_total[5m])", "legendFormat": "auth" },
+        { "expr": "rate(minio_s3_requests_rejected_header_total[5m])", "legendFormat": "header" },
+        { "expr": "rate(minio_s3_requests_rejected_invalid_total[5m])", "legendFormat": "invalid" },
+        { "expr": "rate(minio_s3_requests_rejected_timestamp_total[5m])", "legendFormat": "timestamp" }
+      ]
+    },
+
+    {
+      "id": 300,
+      "title": "── Triton ──",
+      "type": "row",
+      "gridPos": { "x": 0, "y": 30, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "id": 301,
+      "title": "Inference requests/s by model",
+      "description": "nv_inference_request_success: 성공한 요청 count. nv_inference_request_failure: 실패. processor 부하와 직결.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 31, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(nv_inference_request_success[1m]))",
+          "legendFormat": "success {{model}}"
+        },
+        {
+          "expr": "sum by (model) (rate(nv_inference_request_failure[1m]))",
+          "legendFormat": "failure {{model}}"
+        }
+      ]
+    },
+    {
+      "id": 302,
+      "title": "Inference compute latency (avg ms)",
+      "description": "Triton 의 compute_infer 시간은 순수 GPU/CPU 추론 시간(전처리/큐 대기 제외). rate 로 나눈 비율이 평균.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 31, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "ms" } },
+      "targets": [
+        {
+          "expr": "(sum by (model) (rate(nv_inference_compute_infer_duration_us[5m])) / clamp_min(sum by (model) (rate(nv_inference_count[5m])), 1)) / 1000",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "id": 303,
+      "title": "Queue + compute breakdown (avg us)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 39, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "µs" } },
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(nv_inference_queue_duration_us[5m])) / clamp_min(sum by (model) (rate(nv_inference_count[5m])), 1)",
+          "legendFormat": "queue {{model}}"
+        },
+        {
+          "expr": "sum by (model) (rate(nv_inference_compute_input_duration_us[5m])) / clamp_min(sum by (model) (rate(nv_inference_count[5m])), 1)",
+          "legendFormat": "compute_input {{model}}"
+        },
+        {
+          "expr": "sum by (model) (rate(nv_inference_compute_infer_duration_us[5m])) / clamp_min(sum by (model) (rate(nv_inference_count[5m])), 1)",
+          "legendFormat": "compute_infer {{model}}"
+        },
+        {
+          "expr": "sum by (model) (rate(nv_inference_compute_output_duration_us[5m])) / clamp_min(sum by (model) (rate(nv_inference_count[5m])), 1)",
+          "legendFormat": "compute_output {{model}}"
+        }
+      ]
+    },
+    {
+      "id": 304,
+      "title": "GPU utilization (%)",
+      "description": "GPU 경로에서만 의미 있음. CPU Triton 환경에서는 0 유지.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 39, "w": 12, "h": 8 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } },
+      "targets": [
+        {
+          "expr": "avg by (gpu_uuid) (nv_gpu_utilization)",
+          "legendFormat": "{{gpu_uuid}}"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+kafka:
+  bootstrap_servers: kafka:9092
+  group_id: red-poc-transcoder
+  input_topic: raw.frame.metadata
+  output_topic: raw.frame.metadata.decoded
+
+minio:
+  endpoint: minio:9000
+  access_key: swm
+  secret_key: Q7mN2xvP9rT4kL8sW3zB6yHcD5fJ1aXe
+  bucket: red-poc
+  secure: false
+
+decoder:
+  kind: ffmpeg       # ffmpeg | noop
+  jpeg_quality: 85
+  output_suffix: jpg
+
+metrics:
+  port: 2114
