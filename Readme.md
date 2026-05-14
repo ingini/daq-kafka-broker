@@ -9,18 +9,18 @@
 ```
 [차량 - 외부망]
   daq-kafka-producer / start_cameras.sh
-  BROKER_REST_URL=https://221.147.232.196:8443/poc/kafka-rest
+  BROKER_REST_URL=https://{PUBLIC_IP}:{PORT}/poc/kafka-rest
   HTTP POST (REST Proxy v3, headers 포함)
          │
          │ HTTPS (self-signed TLS)
          ▼
-[공인IP 221.147.232.196:8443]
-  공유기 포트포워딩 → 192.168.1.79:8443
+[공인IP {PUBLIC_IP}:{PORT}]
+  공유기 포트포워딩 → {SERVER_IP}:{PORT}
          │
          ▼
-[서버 192.168.1.79]
+[서버 {SERVER_IP}]
   ┌──────────────────────────────────────────────────────┐
-  │  nginx-edge (:8443)                                  │
+  │  nginx-edge (:{PORT})                                │
   │    /poc/kafka-rest/ → kafka-rest-proxy:8082          │
   │    /poc/minio/      → minio:9001 (Console)           │
   │    /poc/grafana/    → grafana:3000                   │
@@ -65,7 +65,8 @@ consumer      bridge        archiver
 
 ```
 daq-kafka-broker/
-├── .env                          ← 설정 전부 여기 (이 파일만 수정)
+├── .env                          ← 설정 전부 여기 (이 파일만 수정, git 제외)
+├── .env.example                  ← .env 템플릿 (git 포함)
 ├── docker-compose.yml
 ├── start.sh                      ← 기동
 ├── stop.sh                       ← 종료
@@ -73,7 +74,7 @@ daq-kafka-broker/
 │
 ├── nginx/
 │   ├── edge.conf                 ← nginx 설정
-│   └── certs/                    ← SSL 인증서 (사전 준비 필요)
+│   └── certs/                    ← SSL 인증서 (git 제외, 사전 준비 필요)
 │       ├── fullchain.pem
 │       └── privkey.pem
 │
@@ -82,23 +83,23 @@ daq-kafka-broker/
 │   └── init-bucket.sh            ← MinIO 버킷 초기화
 │
 ├── models/yolo/
-│   └── yolo26n.pt                ← YOLO 모델 (사전 준비 필요)
+│   └── yolo26n.pt                ← YOLO 모델 (git 제외, 사전 준비 필요)
 │
 ├── triton/
 │   ├── exporter/                 ← .pt → .onnx 변환기
-│   └── model_repository/         ← Triton 모델 저장소
+│   └── model_repository/         ← Triton 모델 저장소 (git 제외)
 │       └── yolo26n/
 │           ├── config.pbtxt
 │           └── 1/model.onnx
 │
 ├── data/input/
-│   └── imu_gps.jsonl             ← GPS 데이터 (processor용)
+│   └── imu_gps.jsonl             ← GPS 데이터 (git 제외, 사전 준비 필요)
 │
 ├── processor/config/
-│   └── application.yml           ← Processor 설정
+│   └── application.yml
 │
 ├── notifier/config/
-│   └── application.yml           ← Notifier 설정
+│   └── application.yml
 │
 ├── kafka-image-consumer/         ← copy-sources.sh 로 복사
 ├── kafka-frame-bridge/           ← copy-sources.sh 로 복사
@@ -111,20 +112,46 @@ daq-kafka-broker/
 ├── postgres/init/                ← copy-sources.sh 로 복사
 ├── prometheus/                   ← copy-sources.sh 로 복사
 ├── grafana/                      ← copy-sources.sh 로 복사
-└── logs/                         ← notifier 로그 출력
+└── logs/                         ← notifier 로그 출력 (git 제외)
 ```
 
 ---
 
 ## 사전 준비
 
-### 1. SSL 인증서 준비
+### 1. `.env` 설정
+
+```bash
+cp .env.example .env
+vi .env
+```
+
+`.env` 필수 입력 항목:
+
+```env
+# 외부 접근 URL (공인IP:PORT)
+RED_EDGE_PUBLIC_URL=https://<PUBLIC_IP>:<PORT>
+
+# MinIO
+MINIO_ROOT_USER=<MinIO 계정>
+MINIO_ROOT_PASSWORD=<MinIO 비밀번호>
+
+# Postgres
+POSTGRES_PASSWORD=<DB 비밀번호>
+
+# Grafana
+GF_SECURITY_ADMIN_PASSWORD=<Grafana 비밀번호>
+GF_SERVER_ROOT_URL=https://<PUBLIC_IP>:<PORT>/poc/grafana/
+```
+
+---
+
+### 2. SSL 인증서 준비
 
 기존 `red-poc-edge` 컨테이너에서 복사:
 
 ```bash
 mkdir -p nginx/certs
-
 docker cp red-poc-edge:/etc/nginx/certs/fullchain.pem nginx/certs/
 docker cp red-poc-edge:/etc/nginx/certs/privkey.pem nginx/certs/
 ```
@@ -143,9 +170,8 @@ openssl req -x509 -nodes -days 365 \
 
 ---
 
-### 2. 소스 복사 (최초 1회)
+### 3. 소스 복사 (최초 1회)
 
-`red-poc` 프로젝트 소스를 `daq-kafka-broker`로 복사합니다.  
 `red-poc` 프로젝트가 `/home/swmai/project/kepco`에 있어야 합니다.
 
 ```bash
@@ -160,20 +186,18 @@ bash copy-sources.sh
 
 ---
 
-### 3. YOLO 모델 준비
-
-모델이 없는 경우 복사:
+### 4. YOLO 모델 준비
 
 ```bash
 mkdir -p models/yolo
 cp /home/swmai/project/kepco/data/models/yolo/yolo26n.pt models/yolo/
 ```
 
-`triton/model_repository/yolo26n/1/model.onnx`가 이미 있으면 자동으로 export 단계를 건너뜁니다.
+`triton/model_repository/yolo26n/1/model.onnx`가 이미 있으면 export 단계를 자동으로 건너뜁니다.
 
 ---
 
-### 4. GPS 데이터 준비 (processor용)
+### 5. GPS 데이터 준비 (processor용)
 
 ```bash
 mkdir -p data/input
@@ -182,35 +206,10 @@ cp /home/swmai/project/kepco/data/input/imu_gps.jsonl data/input/
 
 ---
 
-### 5. `.env` 설정 확인
-
-```bash
-vi .env
-```
-
-필수 확인 항목:
-
-```env
-# 외부 접근 URL
-RED_EDGE_PUBLIC_URL=https://221.147.232.196:8443
-
-# MinIO 크레덴셜
-MINIO_ROOT_USER=swm
-MINIO_ROOT_PASSWORD=your_password_here
-
-# Postgres
-POSTGRES_PASSWORD=your_password_here
-
-# Grafana
-GF_SECURITY_ADMIN_PASSWORD=your_password_here
-```
-
----
-
 ### 6. 공유기 포트포워딩 확인
 
 ```
-외부포트 8443 → 192.168.1.79:8443
+외부포트 <PORT> → <SERVER_IP>:<PORT>
 ```
 
 ---
@@ -221,18 +220,6 @@ GF_SECURITY_ADMIN_PASSWORD=your_password_here
 
 ```bash
 ./start.sh
-```
-
-정상 기동 시:
-```
-=================================================
-  ✅ daq-kafka-broker 통합 스택 기동 완료
-
-  Kafka REST : https://221.147.232.196:8443/poc/kafka-rest
-  MinIO      : https://221.147.232.196:8443/poc/minio
-  Grafana    : https://221.147.232.196:8443/poc/grafana
-  Triton     : http://192.168.1.79:8100/v2/models
-=================================================
 ```
 
 ### 종료
@@ -248,8 +235,8 @@ GF_SECURITY_ADMIN_PASSWORD=your_password_here
 ### `config/config.env` (daq-kafka-producer)
 
 ```env
-VEHICLE_ID=AP500L-001
-BROKER_REST_URL=https://221.147.232.196:8443/poc/kafka-rest
+VEHICLE_ID=<차량 ID>
+BROKER_REST_URL=https://<PUBLIC_IP>:<PORT>/poc/kafka-rest
 BROKER_CLUSTER_ID="Some(red-poc-kraft-cluster)"
 BROKER_REST_TLS_VERIFY=false
 ```
@@ -257,8 +244,8 @@ BROKER_REST_TLS_VERIFY=false
 ### `config.env` (start_cameras.sh)
 
 ```env
-VEHICLE_ID=Grandeur-2288
-BROKER_REST_URL=https://221.147.232.196:8443/poc/kafka-rest
+VEHICLE_ID=<차량 ID>
+BROKER_REST_URL=https://<PUBLIC_IP>:<PORT>/poc/kafka-rest
 BROKER_CLUSTER_ID="Some(red-poc-kraft-cluster)"
 BROKER_REST_TLS_VERIFY=false
 ```
@@ -288,19 +275,19 @@ daq/
 
 ```bash
 # topic 목록
-curl -k https://221.147.232.196:8443/poc/kafka-rest/topics
+curl -k https://<PUBLIC_IP>:<PORT>/poc/kafka-rest/topics
 
-# 단건 POST 테스트
+# 단건 POST 테스트 (v3 API)
 curl -k -X POST \
-  "https://221.147.232.196:8443/poc/kafka-rest/v3/clusters/Some(red-poc-kraft-cluster)/topics/sensor.cam0.jpeg/records" \
+  "https://<PUBLIC_IP>:<PORT>/poc/kafka-rest/v3/clusters/Some(red-poc-kraft-cluster)/topics/sensor.cam0.jpeg/records" \
   -H "Content-Type: application/json" \
   -d '{
-    "key":   {"type":"BINARY","data":"R3JhbmRldXItMjI4OA=="},
-    "value": {"type":"BINARY","data":"dGVzdA=="},
+    "key":   {"type":"BINARY","data":"<base64(vehicle_id)>"},
+    "value": {"type":"BINARY","data":"<base64(payload)>"},
     "headers": [
-      {"name":"vehicle_id","value":"R3JhbmRldXItMjI4OA=="},
-      {"name":"sensor",    "value":"Y2FtMA=="},
-      {"name":"ts_ns",     "value":"MTIzNDU2Nzg5MA=="}
+      {"name":"vehicle_id","value":"<base64(vehicle_id)>"},
+      {"name":"sensor",    "value":"<base64(cam0)>"},
+      {"name":"ts_ns",     "value":"<base64(ts_ns)>"}
     ]
   }'
 ```
@@ -321,7 +308,7 @@ docker compose ps                             # 전체 상태
 docker run --rm --network red-poc-net \
   --entrypoint sh \
   minio/mc:RELEASE.2024-06-12T14-34-03Z \
-  -c 'mc alias set local http://minio:9000 swm your_password && \
+  -c 'mc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD && \
       mc ls --recursive local/daq | tail -10'
 ```
 
@@ -354,7 +341,7 @@ docker exec red-poc-edge nginx -s reload
 docker run --rm --network red-poc-net \
   --entrypoint sh \
   minio/mc:RELEASE.2024-06-12T14-34-03Z \
-  -c 'mc alias set local http://minio:9000 swm your_password && \
+  -c 'mc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD && \
       mc ilm add --expiry-days 30 local/daq'
 ```
 
@@ -389,6 +376,11 @@ docker run --rm --network red-poc-net \
 
 | 항목 | 기본값 | 설명 |
 |------|--------|------|
+| `RED_EDGE_PUBLIC_URL` | - | 외부 접근 URL (필수 입력) |
+| `MINIO_ROOT_USER` | - | MinIO 계정 (필수 입력) |
+| `MINIO_ROOT_PASSWORD` | - | MinIO 비밀번호 (필수 입력) |
+| `POSTGRES_PASSWORD` | - | DB 비밀번호 (필수 입력) |
+| `GF_SECURITY_ADMIN_PASSWORD` | - | Grafana 비밀번호 (필수 입력) |
 | `KAFKA_MESSAGE_MAX_BYTES` | 10MB | 메시지 최대 크기 |
 | `FRAME_BRIDGE_BUNDLE_WINDOW_MS` | 1000 | 프레임 번들 윈도우(ms) |
 | `IMU_ARCHIVER_BATCH_SIZE` | 1000 | IMU parquet flush 배치 |
