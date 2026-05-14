@@ -284,7 +284,7 @@ services:
   # ── Triton ONNX Export (최초 1회) ────────────────────────────
   triton-exporter:
     build:
-      context: /home/swmai/project/kepco/infra/triton/exporter
+      context: ./triton/exporter
     image: red-poc/triton-exporter:dev
     container_name: red-poc-triton-exporter
     networks: [red-poc]
