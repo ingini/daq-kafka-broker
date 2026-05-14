@@ -20,7 +20,7 @@ notification:
 s3:
   endpoint: "http://minio:9000"
   access_key: "swm"
-  secret_key: "Q7mN2xvP9rT4kL8sW3zB6yHcD5fJ1aXe"
+  secret_key: "${MINIO_ROOT_PASSWORD}"
   region: "us-east-1"
   presign_ttl_hours: 24
 
