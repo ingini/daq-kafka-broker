@@ -259,7 +259,7 @@ vi .env
 
 필수 입력:
 ```env
-RED_EDGE_PUBLIC_URL=https://<PUBLIC_IP>:<PORT>
+KAFKA_PUBLIC_URL=https://<PUBLIC_IP>:<PORT>
 MINIO_ROOT_PASSWORD=<비밀번호>
 POSTGRES_PASSWORD=<비밀번호>
 GF_SECURITY_ADMIN_PASSWORD=<비밀번호>
@@ -267,13 +267,6 @@ GF_SERVER_ROOT_URL=https://<PUBLIC_IP>:<PORT>/poc/grafana/
 ```
 
 ### 2. SSL 인증서
-
-기존 인증서 복사:
-```bash
-mkdir -p nginx/certs
-docker cp red-poc-edge:/etc/nginx/certs/fullchain.pem nginx/certs/
-docker cp red-poc-edge:/etc/nginx/certs/privkey.pem nginx/certs/
-```
 
 신규 self-signed 생성:
 ```bash
@@ -351,13 +344,13 @@ daq/
 curl -k https://<PUBLIC_IP>:<PORT>/poc/kafka-rest/topics
 
 # 로그
-docker logs -f red-poc-topic-mapper
-docker logs -f red-poc-kafka-image-consumer
-docker logs -f red-poc-processor
+docker logs -f kafka-topic-mapper
+docker logs -f kafka-kafka-image-consumer
+docker logs -f kafka-processor
 docker compose ps
 
 # MinIO 저장 확인
-docker run --rm --network red-poc-net \
+docker run --rm --network daq-net \
   --entrypoint sh minio/mc:RELEASE.2024-06-12T14-34-03Z \
   -c 'mc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD && \
       mc ls --recursive local/daq | tail -10'
@@ -384,7 +377,7 @@ docker run --rm --network red-poc-net \
 
 | 항목 | 필수 | 설명 |
 |------|------|------|
-| `RED_EDGE_PUBLIC_URL` | ✅ | 외부 접근 URL |
+| `KAFKA_BROKER_PUBLIC_URL` | ✅ | 외부 접근 URL |
 | `MINIO_ROOT_USER` | ✅ | MinIO 계정 |
 | `MINIO_ROOT_PASSWORD` | ✅ | MinIO 비밀번호 |
 | `POSTGRES_PASSWORD` | ✅ | DB 비밀번호 |
