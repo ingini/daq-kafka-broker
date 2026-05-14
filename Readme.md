@@ -1,6 +1,7 @@
 # daq-kafka-broker
 
-차량(AP500L 등)에서 수집한 센서 데이터를 Kafka REST Proxy로 수신하고, MinIO에 저장하며 Triton 추론까지 처리하는 통합 브로커 서버.
+차량(AP500L 등)에서 수집한 센서 데이터를 Kafka REST Proxy로 수신하고,  
+MinIO에 저장하며 YOLO 기반 Triton 추론까지 처리하는 통합 브로커 서버.
 
 ---
 
@@ -9,18 +10,18 @@
 ```
 [차량 - 외부망]
   daq-kafka-producer / start_cameras.sh
-  BROKER_REST_URL=https://{PUBLIC_IP}:{PORT}/poc/kafka-rest
+  BROKER_REST_URL=https://<PUBLIC_IP>:<PORT>/poc/kafka-rest
   HTTP POST (REST Proxy v3, headers 포함)
          │
          │ HTTPS (self-signed TLS)
          ▼
-[공인IP {PUBLIC_IP}:{PORT}]
-  공유기 포트포워딩 → {SERVER_IP}:{PORT}
+[공인IP <PUBLIC_IP>:<PORT>]
+  공유기 포트포워딩 → <SERVER_IP>:<PORT>
          │
          ▼
-[서버 {SERVER_IP}]
+[서버 <SERVER_IP>]
   ┌──────────────────────────────────────────────────────┐
-  │  nginx-edge (:{PORT})                                │
+  │  nginx-edge (:<PORT>)                                │
   │    /poc/kafka-rest/ → kafka-rest-proxy:8082          │
   │    /poc/minio/      → minio:9001 (Console)           │
   │    /poc/grafana/    → grafana:3000                   │
@@ -33,15 +34,16 @@
                  │ produce
         ┌────────▼──────────┐
         │  kafka (KRaft)    │ apache/kafka:3.7.0
-        │  CLUSTER_ID:      │
+        │  CLUSTER_ID:      │ KAFKA_AUTO_CREATE=false
         │  red-poc-kraft-   │
         │  cluster          │
         └────────┬──────────┘
                  │
          ┌───────▼────────┐
          │  topic-mapper  │ sensor.* → raw.*
-         │  - 12B 헤더    │ (ts_ns 추출 + header 추가)
-         │    제거        │
+         │  ① 12B 헤더    │ [8B ts_ns][4B len][JPEG]
+         │    제거        │ → 순수 JPEG + ts_ns header
+         │  ② schema 변환 │ gnss: lat/lon/alt 정규화
          └───────┬────────┘
                  │
     ┌────────────┼────────────┐
@@ -49,14 +51,133 @@
     ▼            ▼            ▼
 kafka-image-  kafka-frame-  kafka-imu-
 consumer      bridge        archiver
-(JPEG→MinIO)  (번들링)      (IMU/GPS→Parquet)
+(JPEG→MinIO)  (프레임 번들) (IMU/GPS→Parquet)
     │            │
     ▼            ▼
-  minio       processor
-  (저장)      (Triton 추론)
+  MinIO       processor ──── Triton
+  저장        (YOLO 추론)    (yolov8n ONNX)
                  │
               notifier
               (이벤트 알림)
+              file_log / Slack
+```
+
+---
+
+## 서비스 역할
+
+| 서비스 | 역할 |
+|--------|------|
+| `kafka` | 메시지 브로커 (KRaft, ZooKeeper 없음) |
+| `kafka-rest-proxy` | 차량 HTTP POST 수신 |
+| `topic-mapper` | `sensor.*` → `raw.*` 변환 (12B 헤더 제거, schema 변환) |
+| `kafka-image-consumer` | `raw.frame.images` → MinIO JPEG 저장 |
+| `kafka-frame-bridge` | 프레임 번들링 → `raw.frame.metadata.decoded` |
+| `kafka-imu-archiver` | IMU/GPS → MinIO Parquet 저장 |
+| `triton` | YOLO ONNX 추론 서버 |
+| `processor` | Triton 추론 결과 → `events.detection` |
+| `notifier` | 이벤트 감지 → file_log / Slack 알림 |
+| `minio` | 오브젝트 스토리지 |
+| `postgres` | 이벤트 메타데이터 DB |
+| `nginx-edge` | SSL termination + 라우팅 |
+
+---
+
+## Processor 상세
+
+### 역할
+```
+raw.frame.metadata.decoded (Kafka)
+  → MinIO에서 JPEG 가져오기
+  → Triton YOLO 추론
+  → bbox 시각화 (annotated JPEG → MinIO 저장)
+  → events.detection (Kafka) 발행
+  → notifier 트리거
+```
+
+### 설정 (`processor/config/application.yml`)
+
+```yaml
+inference:
+  kind: triton                          # triton | mock
+  triton:
+    confidence_threshold: 0.4           # 검출 신뢰도 임계값 (0.0~1.0)
+    timeout_ms: 5000                    # 추론 타임아웃
+  allowed_classes: []                   # 빈 배열 = COCO 80클래스 전부
+                                        # 예: ["car", "person", "bus", "truck"]
+
+visualize:
+  enabled: true                         # bbox 그린 결과 MinIO 저장
+  jpeg_quality: 85
+  subdir: result                        # 저장 경로: .../cam0/result/...
+  key_suffix: _annotated.jpg
+
+gps:
+  kind: file                            # file | kafka | none
+  file_path: /app/imu_gps.jsonl        # kind=file 일 때 사용
+```
+
+### .env에서 조정 가능한 항목
+
+```env
+PROCESSOR_CONFIDENCE_THRESHOLD=0.4     # 신뢰도 임계값
+PROCESSOR_TRITON_TIMEOUT_MS=5000       # 추론 타임아웃
+PROCESSOR_VISUALIZE_ENABLED=true       # 시각화 결과 저장
+PROCESSOR_GPS_KIND=file                # GPS 소스 (file/kafka/none)
+```
+
+---
+
+## Notifier 상세
+
+### 역할
+```
+events.detection (Kafka)
+  → Postgres 저장
+  → file_log 또는 Slack 알림
+  → presigned URL로 annotated JPEG 링크 포함
+```
+
+### Slack 설정 방법
+
+**1. Slack App 생성**
+```
+https://api.slack.com/apps
+→ Create New App → From scratch
+→ App Name: daq-notifier
+→ Workspace 선택
+```
+
+**2. Bot Token 권한 추가**
+```
+OAuth & Permissions → Bot Token Scopes
+→ chat:write 추가
+→ Install to Workspace
+→ Bot User OAuth Token 복사 (xoxb-...)
+```
+
+**3. 채널에 Bot 초대**
+```
+Slack 채널에서: /invite @daq-notifier
+```
+
+**4. .env 설정**
+```env
+NOTIFIER_KIND=slack
+NOTIFIER_SLACK_TOKEN=xoxb-xxxxxxxxxxxx-xxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxx
+NOTIFIER_SLACK_CHANNEL=#road-events
+```
+
+### file_log 모드 (기본)
+
+Slack 없이 파일로 로그:
+```env
+NOTIFIER_KIND=file_log
+```
+
+로그 확인:
+```bash
+tail -f logs/messages.jsonl | python3 -m json.tool
 ```
 
 ---
@@ -65,59 +186,69 @@ consumer      bridge        archiver
 
 ```
 daq-kafka-broker/
-├── .env                          ← 설정 전부 여기 (이 파일만 수정, git 제외)
-├── .env.example                  ← .env 템플릿 (git 포함)
-├── docker-compose.yml
+├── .env                          ← 설정 전부 여기 (git 제외)
+├── .env.example                  ← 템플릿 (git 포함)
+├── .gitignore
+├── setup.sh                      ← 최초 1회 실행 (자동 설정)
 ├── start.sh                      ← 기동
 ├── stop.sh                       ← 종료
-├── copy-sources.sh               ← 최초 1회 소스 복사
 │
 ├── nginx/
-│   ├── edge.conf                 ← nginx 설정
-│   └── certs/                    ← SSL 인증서 (git 제외, 사전 준비 필요)
+│   ├── edge.conf
+│   └── certs/                    ← git 제외, setup.sh 자동 생성
 │       ├── fullchain.pem
 │       └── privkey.pem
 │
 ├── kafka/
-│   ├── init-topics.sh            ← Kafka topic 초기화
-│   └── init-bucket.sh            ← MinIO 버킷 초기화
+│   ├── init-topics.sh
+│   └── init-bucket.sh
 │
 ├── models/yolo/
-│   └── yolo26n.pt                ← YOLO 모델 (git 제외, 사전 준비 필요)
+│   └── yolo26n.pt                ← git 제외, setup.sh 자동 다운로드
 │
 ├── triton/
-│   ├── exporter/                 ← .pt → .onnx 변환기
-│   └── model_repository/         ← Triton 모델 저장소 (git 제외)
-│       └── yolo26n/
-│           ├── config.pbtxt
-│           └── 1/model.onnx
+│   ├── exporter/
+│   └── model_repository/         ← git 제외, setup.sh 자동 생성
 │
 ├── data/input/
-│   └── imu_gps.jsonl             ← GPS 데이터 (git 제외, 사전 준비 필요)
+│   └── imu_gps.jsonl             ← git 제외, setup.sh 자동 생성
 │
-├── processor/config/
-│   └── application.yml
+├── processor/config/application.yml
+├── notifier/config/application.yml
 │
-├── notifier/config/
-│   └── application.yml
-│
-├── kafka-image-consumer/         ← copy-sources.sh 로 복사
-├── kafka-frame-bridge/           ← copy-sources.sh 로 복사
-├── kafka-imu-archiver/           ← copy-sources.sh 로 복사
-├── topic-mapper/                 ← copy-sources.sh 로 복사 (패치본)
-├── mqtt-kafka-bridge/            ← copy-sources.sh 로 복사
-├── processor/                    ← copy-sources.sh 로 복사
-├── notifier/                     ← copy-sources.sh 로 복사
-├── transcoder/                   ← copy-sources.sh 로 복사
-├── postgres/init/                ← copy-sources.sh 로 복사
-├── prometheus/                   ← copy-sources.sh 로 복사
-├── grafana/                      ← copy-sources.sh 로 복사
-└── logs/                         ← notifier 로그 출력 (git 제외)
+├── kafka-image-consumer/
+├── kafka-frame-bridge/
+├── kafka-imu-archiver/
+├── topic-mapper/                 ← 패치본 (12B 헤더 제거)
+├── mqtt-kafka-bridge/
+├── processor/
+├── notifier/
+├── transcoder/
+├── postgres/init/
+├── prometheus/
+├── grafana/
+└── logs/                         ← git 제외
 ```
 
 ---
 
-## 사전 준비
+## 빠른 시작 (새 서버)
+
+```bash
+# 1. clone
+git clone https://github.com/ingini/daq-kafka-broker.git
+cd daq-kafka-broker
+
+# 2. 자동 설정 (인증서 생성, 모델 다운로드 등)
+bash setup.sh
+
+# 3. 기동
+./start.sh
+```
+
+---
+
+## 사전 준비 (수동)
 
 ### 1. `.env` 설정
 
@@ -126,38 +257,25 @@ cp .env.example .env
 vi .env
 ```
 
-`.env` 필수 입력 항목:
-
+필수 입력:
 ```env
-# 외부 접근 URL (공인IP:PORT)
 RED_EDGE_PUBLIC_URL=https://<PUBLIC_IP>:<PORT>
-
-# MinIO
-MINIO_ROOT_USER=<MinIO 계정>
-MINIO_ROOT_PASSWORD=<MinIO 비밀번호>
-
-# Postgres
-POSTGRES_PASSWORD=<DB 비밀번호>
-
-# Grafana
-GF_SECURITY_ADMIN_PASSWORD=<Grafana 비밀번호>
+MINIO_ROOT_PASSWORD=<비밀번호>
+POSTGRES_PASSWORD=<비밀번호>
+GF_SECURITY_ADMIN_PASSWORD=<비밀번호>
 GF_SERVER_ROOT_URL=https://<PUBLIC_IP>:<PORT>/poc/grafana/
 ```
 
----
+### 2. SSL 인증서
 
-### 2. SSL 인증서 준비
-
-기존 `red-poc-edge` 컨테이너에서 복사:
-
+기존 인증서 복사:
 ```bash
 mkdir -p nginx/certs
 docker cp red-poc-edge:/etc/nginx/certs/fullchain.pem nginx/certs/
 docker cp red-poc-edge:/etc/nginx/certs/privkey.pem nginx/certs/
 ```
 
-또는 self-signed 인증서 신규 생성:
-
+신규 self-signed 생성:
 ```bash
 openssl req -x509 -nodes -days 365 \
   -newkey rsa:2048 \
@@ -166,47 +284,22 @@ openssl req -x509 -nodes -days 365 \
   -subj "/C=KR/O=swm/CN=daq-broker"
 ```
 
-> ⚠️ `privkey.pem`은 절대 git에 올리지 마세요. `.gitignore`에 등록되어 있습니다.
+### 3. YOLO 모델
 
----
-
-### 3. 소스 복사 (최초 1회)
-
-`red-poc` 프로젝트가 `/home/swmai/project/kepco`에 있어야 합니다.
-
+자동 다운로드:
 ```bash
-bash copy-sources.sh
+docker run --rm \
+  -v "$PWD/models/yolo:/output" \
+  ultralytics/ultralytics:latest \
+  python3 -c "
+from ultralytics import YOLO
+import shutil
+m = YOLO('yolov8n.pt')
+shutil.copy(m.ckpt_path, '/output/yolo26n.pt')
+"
 ```
 
-복사되는 서비스:
-- `kafka-image-consumer` `kafka-frame-bridge` `kafka-imu-archiver`
-- `topic-mapper` (패치본 — 12B 헤더 제거 + ts_ns header 추가)
-- `mqtt-kafka-bridge` `processor` `notifier` `transcoder`
-- `postgres/init` `prometheus` `grafana`
-
----
-
-### 4. YOLO 모델 준비
-
-```bash
-mkdir -p models/yolo
-cp /home/swmai/project/kepco/data/models/yolo/yolo26n.pt models/yolo/
-```
-
-`triton/model_repository/yolo26n/1/model.onnx`가 이미 있으면 export 단계를 자동으로 건너뜁니다.
-
----
-
-### 5. GPS 데이터 준비 (processor용)
-
-```bash
-mkdir -p data/input
-cp /home/swmai/project/kepco/data/input/imu_gps.jsonl data/input/
-```
-
----
-
-### 6. 공유기 포트포워딩 확인
+### 4. 공유기 포트포워딩
 
 ```
 외부포트 <PORT> → <SERVER_IP>:<PORT>
@@ -216,32 +309,16 @@ cp /home/swmai/project/kepco/data/input/imu_gps.jsonl data/input/
 
 ## 실행
 
-### 기동
-
 ```bash
-./start.sh
-```
-
-### 종료
-
-```bash
-./stop.sh
+./start.sh    # 기동
+./stop.sh     # 종료
 ```
 
 ---
 
 ## 차량 설정
 
-### `config/config.env` (daq-kafka-producer)
-
-```env
-VEHICLE_ID=<차량 ID>
-BROKER_REST_URL=https://<PUBLIC_IP>:<PORT>/poc/kafka-rest
-BROKER_CLUSTER_ID="Some(red-poc-kraft-cluster)"
-BROKER_REST_TLS_VERIFY=false
-```
-
-### `config.env` (start_cameras.sh)
+### `config/config.env` (daq-kafka-producer / start_cameras.sh)
 
 ```env
 VEHICLE_ID=<차량 ID>
@@ -256,93 +333,34 @@ BROKER_REST_TLS_VERIFY=false
 
 ```
 daq/
-└── year=YYYY/
-    └── month=MM/
-        └── day=DD/
-            └── HH/
-                └── {vehicle_id}/
-                    ├── cam0/{YYYYMMDDTHHMMSS}_{ts_ns}.jpg
-                    ├── cam1/{YYYYMMDDTHHMMSS}_{ts_ns}.jpg
-                    ├── cam2/{YYYYMMDDTHHMMSS}_{ts_ns}.jpg
-                    └── gnss/{ts_ns}.parquet
+└── year=YYYY/month=MM/day=DD/HH/
+    └── {vehicle_id}/
+        ├── cam0/{YYYYMMDDTHHMMSS}_{ts_ns}.jpg
+        ├── cam1/{YYYYMMDDTHHMMSS}_{ts_ns}.jpg
+        ├── cam2/{YYYYMMDDTHHMMSS}_{ts_ns}.jpg
+        ├── cam0/result/{ts}_annotated.jpg   ← processor 결과
+        └── gnss/{ts_ns}.parquet
 ```
 
 ---
 
 ## 동작 확인
 
-### REST Proxy 연결 테스트
-
 ```bash
-# topic 목록
+# REST Proxy 테스트
 curl -k https://<PUBLIC_IP>:<PORT>/poc/kafka-rest/topics
 
-# 단건 POST 테스트 (v3 API)
-curl -k -X POST \
-  "https://<PUBLIC_IP>:<PORT>/poc/kafka-rest/v3/clusters/Some(red-poc-kraft-cluster)/topics/sensor.cam0.jpeg/records" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "key":   {"type":"BINARY","data":"<base64(vehicle_id)>"},
-    "value": {"type":"BINARY","data":"<base64(payload)>"},
-    "headers": [
-      {"name":"vehicle_id","value":"<base64(vehicle_id)>"},
-      {"name":"sensor",    "value":"<base64(cam0)>"},
-      {"name":"ts_ns",     "value":"<base64(ts_ns)>"}
-    ]
-  }'
-```
+# 로그
+docker logs -f red-poc-topic-mapper
+docker logs -f red-poc-kafka-image-consumer
+docker logs -f red-poc-processor
+docker compose ps
 
-### 로그 확인
-
-```bash
-docker logs -f red-poc-kafka-image-consumer   # MinIO 저장 현황
-docker logs -f red-poc-topic-mapper           # sensor.* → raw.* 변환
-docker logs -f red-poc-processor              # Triton 추론
-docker logs -f red-poc-edge                   # nginx 접근 로그
-docker compose ps                             # 전체 상태
-```
-
-### MinIO 저장 확인
-
-```bash
+# MinIO 저장 확인
 docker run --rm --network red-poc-net \
-  --entrypoint sh \
-  minio/mc:RELEASE.2024-06-12T14-34-03Z \
+  --entrypoint sh minio/mc:RELEASE.2024-06-12T14-34-03Z \
   -c 'mc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD && \
       mc ls --recursive local/daq | tail -10'
-```
-
----
-
-## 운영 중 설정 변경
-
-### topic 추가
-
-```bash
-docker exec red-poc-kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server localhost:9092 \
-  --create --if-not-exists \
-  --topic sensor.lidar \
-  --partitions 3 \
-  --replication-factor 1
-```
-
-### nginx 설정 변경 (무중단)
-
-```bash
-vi nginx/edge.conf
-docker exec red-poc-edge nginx -t
-docker exec red-poc-edge nginx -s reload
-```
-
-### MinIO lifecycle (자동 삭제)
-
-```bash
-docker run --rm --network red-poc-net \
-  --entrypoint sh \
-  minio/mc:RELEASE.2024-06-12T14-34-03Z \
-  -c 'mc alias set local http://minio:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD && \
-      mc ilm add --expiry-days 30 local/daq'
 ```
 
 ---
@@ -352,39 +370,29 @@ docker run --rm --network red-poc-net \
 | 증상 | 원인 | 조치 |
 |------|------|------|
 | POST → XML 에러 (MinIO) | nginx S3 block에 IP 등록 | `edge.conf` `server_name s3.swm.ai`만 남기기 |
-| POST → 422 Unrecognized headers | REST Proxy v2 사용 중 | v3 API 사용 (`/v3/clusters/...`) |
-| JPEG 깨짐 (12B 헤더 포함) | topic-mapper passthrough | `copy-sources.sh` 재실행 (패치본 복사) |
-| MinIO 로그인 불가 | IAM 초기화 필요 | `rm -rf /data14/poc-minio/.minio.sys/config/iam/*` 후 재시작 |
-| Kafka 기동 실패 | 볼륨 데이터 충돌 | `docker compose down -v` 후 재시작 |
-| nginx 502 | 백엔드 컨테이너 미기동 | `docker compose ps` 확인 |
-| SSL 인증서 오류 | certs/ 파일 없음 | `nginx/certs/` 인증서 복사 |
+| POST → 422 headers 에러 | REST Proxy v2 사용 | v3 API 사용 (`/v3/clusters/...`) |
+| JPEG 깨짐 | topic-mapper 12B 헤더 미제거 | topic-mapper 패치본 확인 |
+| MinIO 로그인 불가 | IAM 초기화 필요 | `rm -rf <minio_data>/.minio.sys/config/iam/*` |
+| Kafka 기동 실패 | 볼륨 충돌 | `docker compose down -v` 후 재시작 |
+| nginx 502 | 백엔드 미기동 | `docker compose ps` 확인 |
+| Triton 추론 실패 | model.onnx 없음 | `bash setup.sh` 재실행 |
+| Slack 알림 안 옴 | Token/채널 설정 오류 | `.env` `NOTIFIER_SLACK_TOKEN` 확인, 채널에 Bot 초대 |
 
 ---
 
-## 데이터 보존 정책
+## .env 주요 항목
 
-| 항목 | 기본값 | 설명 |
-|------|--------|------|
-| Kafka 보존 시간 | 72시간 | `.env` `KAFKA_LOG_RETENTION_HOURS` |
-| Kafka 보존 용량 | 100GB | `.env` `KAFKA_LOG_RETENTION_BYTES` |
-| JPEG topic 보존 | 1시간 | `kafka/init-topics.sh` |
-| MinIO | 무제한 | mc ilm 으로 설정 가능 |
-
----
-
-## .env 주요 설정 항목
-
-| 항목 | 기본값 | 설명 |
-|------|--------|------|
-| `RED_EDGE_PUBLIC_URL` | - | 외부 접근 URL (필수 입력) |
-| `MINIO_ROOT_USER` | - | MinIO 계정 (필수 입력) |
-| `MINIO_ROOT_PASSWORD` | - | MinIO 비밀번호 (필수 입력) |
-| `POSTGRES_PASSWORD` | - | DB 비밀번호 (필수 입력) |
-| `GF_SECURITY_ADMIN_PASSWORD` | - | Grafana 비밀번호 (필수 입력) |
-| `KAFKA_MESSAGE_MAX_BYTES` | 10MB | 메시지 최대 크기 |
-| `FRAME_BRIDGE_BUNDLE_WINDOW_MS` | 1000 | 프레임 번들 윈도우(ms) |
-| `IMU_ARCHIVER_BATCH_SIZE` | 1000 | IMU parquet flush 배치 |
-| `PROCESSOR_CONFIDENCE_THRESHOLD` | 0.4 | YOLO 신뢰도 임계값 |
-| `PROCESSOR_VISUALIZE_ENABLED` | true | bbox 시각화 저장 여부 |
-| `NOTIFIER_KIND` | file_log | 알림 방식 (file_log/slack) |
-| `DAQ_CONSUMER_MAX_WORKERS` | 4 | MinIO 업로드 동시 worker |
+| 항목 | 필수 | 설명 |
+|------|------|------|
+| `RED_EDGE_PUBLIC_URL` | ✅ | 외부 접근 URL |
+| `MINIO_ROOT_USER` | ✅ | MinIO 계정 |
+| `MINIO_ROOT_PASSWORD` | ✅ | MinIO 비밀번호 |
+| `POSTGRES_PASSWORD` | ✅ | DB 비밀번호 |
+| `GF_SECURITY_ADMIN_PASSWORD` | ✅ | Grafana 비밀번호 |
+| `NOTIFIER_KIND` | - | `file_log` / `slack` (기본: file_log) |
+| `NOTIFIER_SLACK_TOKEN` | - | Slack Bot Token (xoxb-...) |
+| `NOTIFIER_SLACK_CHANNEL` | - | Slack 채널 (기본: #road-events) |
+| `PROCESSOR_CONFIDENCE_THRESHOLD` | - | YOLO 신뢰도 (기본: 0.4) |
+| `PROCESSOR_VISUALIZE_ENABLED` | - | bbox 시각화 저장 (기본: true) |
+| `KAFKA_MESSAGE_MAX_BYTES` | - | 메시지 최대 크기 (기본: 10MB) |
+| `KAFKA_LOG_RETENTION_HOURS` | - | Kafka 보존 시간 (기본: 72h) |
