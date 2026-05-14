@@ -31,8 +31,8 @@ gps:
 
 s3:
   endpoint: http://minio:9000
-  access_key: swm
-  secret_key: ${MINIO_ROOT_PASSWORD}
+  access_key: "${MINIO_ROOT_USER}"
+  secret_key: "${MINIO_ROOT_PASSWORD}"
   region: us-east-1
 
 mock:
