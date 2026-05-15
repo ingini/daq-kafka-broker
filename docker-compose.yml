@@ -270,7 +270,7 @@ services:
     environment:
       KAFKA_BOOTSTRAP: kafka:9092
       KAFKA_GROUP_ID: daq-consumer-group
-      KAFKA_TOPICS: ${TOPIC_CAM0},${TOPIC_CAM1},${TOPIC_CAM2},${TOPIC_GNSS}
+      KAFKA_TOPICS: ${TOPIC_CAM0},${TOPIC_CAM1},${TOPIC_CAM2},${TOPIC_GNSS},sensor.fused
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
@@ -279,7 +279,7 @@ services:
       LOG_LEVEL: ${DAQ_CONSUMER_LOG_LEVEL:-INFO}
     logging:
       driver: "json-file"
-      options: {max-size: "20m", max-file: "5"}
+      options: {max-size: "50m", max-file: "5"}
 
   # ── Triton ONNX Export (최초 1회) ────────────────────────────
   triton-exporter:
